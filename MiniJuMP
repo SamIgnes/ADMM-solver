@@ -1,0 +1,422 @@
+module MiniJuMP
+using LinearAlgebra
+
+import Base: +, -, *, /, ^, <=, ==, >=, show, zero, hash, isequal, adjoint
+import LinearAlgebra: norm
+
+# --- 1. Strutture Dati ---
+struct DynamicsData
+    state_name::Symbol
+    input_name::Symbol
+    A_list::Vector{Matrix{Float64}}
+    B_list::Vector{Matrix{Float64}}
+    c_list::Vector{Vector{Float64}}
+    x0::Union{Vector{Float64}, Nothing} 
+    settings::Dict{Symbol, Any} 
+end
+
+mutable struct Model
+    variables::Vector{Any}
+    constraints::Vector{Any}
+    soc_constraints::Vector{Any}
+    objective::Any
+    obj_sense::Symbol
+    
+    # Registro Variabili: Simbolo -> (Vettore Indici Piatti, Shape Originale)
+    var_info::Dict{Symbol, Tuple{Vector{Int}, Tuple}}
+    
+    # [NEW] Campo opzionale per la dinamica
+    dynamics::Union{DynamicsData, Nothing}
+
+    Model() = new([], [], [], nothing, :Min, Dict{Symbol, Tuple{Vector{Int}, Tuple}}(), nothing)
+end
+
+struct Variable
+    model::Model
+    idx::Int
+    name::Symbol
+end
+
+Base.hash(v::Variable, h::UInt) = hash(v.idx, hash(objectid(v.model), h))
+Base.isequal(v1::Variable, v2::Variable) = (v1.idx == v2.idx && v1.model === v2.model)
+
+struct AffExpr
+    terms::Dict{Variable, Float64}
+    constant::Float64
+end
+
+struct QuadExpr
+    quad_terms::Dict{Tuple{Variable, Variable}, Float64} 
+    aff::AffExpr
+end
+
+struct Constraint
+    expr::AffExpr
+    sense::Symbol 
+end
+
+struct SOCConstraint
+    vector_part::Vector{AffExpr} 
+    scalar_part::AffExpr         
+end
+
+struct NormWrapper
+    exprs::Vector{AffExpr}
+end
+
+# --- 2. Conversioni e Zero ---
+Base.zero(::Type{AffExpr}) = AffExpr(Dict{Variable, Float64}(), 0.0)
+Base.zero(::Type{Variable}) = Base.zero(AffExpr)
+Base.zero(::AffExpr) = Base.zero(AffExpr)
+Base.zero(::Variable) = Base.zero(AffExpr)
+Base.zero(::Type{QuadExpr}) = QuadExpr(Dict{Tuple{Variable, Variable}, Float64}(), zero(AffExpr))
+Base.zero(::QuadExpr) = Base.zero(QuadExpr)
+
+Base.adjoint(v::Variable) = v
+Base.adjoint(e::AffExpr) = e
+Base.adjoint(q::QuadExpr) = q
+
+to_aff(v::Variable) = AffExpr(Dict(v => 1.0), 0.0)
+to_aff(n::Number) = AffExpr(Dict{Variable, Float64}(), Float64(n))
+to_aff(e::AffExpr) = e
+
+to_quad(q::QuadExpr) = q
+to_quad(x::Union{Variable, AffExpr, Number}) = QuadExpr(Dict{Tuple{Variable, Variable}, Float64}(), to_aff(x))
+
+# --- 3. Macro Aggiornata [NEW] ---
+function add_variable!(m::Model, name::String)
+    v = Variable(m, length(m.variables) + 1, Symbol(name))
+    push!(m.variables, v)
+    return v
+end
+
+macro variable(model, expr)
+    # Caso Array: x[1:N, 1:M]
+    if isa(expr, Expr) && expr.head == :ref
+        var_name = expr.args[1]
+        ranges = expr.args[2:end]
+        return quote
+            # 1. Creiamo le variabili
+            vars = [add_variable!($(esc(model)), string($(QuoteNode(var_name)), "[", join(I.I, ","), "]"))
+                for I in CartesianIndices(($(esc.(ranges)...),))]
+            
+            # 2. [NEW] Registriamo i metadati nel modello
+            # Salviamo gli indici lineari appiattiti e la shape originale
+            flat_indices = [v.idx for v in vars]
+            $(esc(model)).var_info[$(QuoteNode(var_name))] = (vec(flat_indices), size(vars))
+            
+            # 3. Assegniamo alla variabile utente
+            $(esc(var_name)) = vars
+        end
+    
+    # Caso Scalare: x
+    elseif isa(expr, Symbol)
+        return quote
+            var = add_variable!($(esc(model)), string($(QuoteNode(expr))))
+            
+            # [NEW] Registriamo lo scalare (shape vuota o dimensione 1)
+            $(esc(model)).var_info[$(QuoteNode(expr))] = ([var.idx], ())
+            
+            $(esc(expr)) = var
+        end
+    end
+end
+
+macro constraint(model, expr)
+    return quote
+        c = $(esc(expr))
+        if isa(c, Array); append!($(esc(model)).constraints, vec(c))
+        elseif isa(c, SOCConstraint); push!($(esc(model)).soc_constraints, c)
+        else; push!($(esc(model)).constraints, c)
+        end
+    end
+end
+
+macro objective(model, sense, expr)
+    return quote; $(esc(model)).obj_sense = $(QuoteNode(sense)); $(esc(model)).objective = to_quad($(esc(expr))); end
+end
+
+"""
+    @dynamics(model, state_var, input_var, A_list, B_list, [c_list], kwargs...)
+
+Definisce la dinamica del sistema x_{k+1} = A_k x_k + B_k u_k + c_k.
+Salva le informazioni nel modello per essere processate dal ProblemCreator.
+
+Argomenti:
+- `state_var`: Simbolo della variabile di stato (es. x)
+- `input_var`: Simbolo della variabile di input (es. u)
+- `A_list`, `B_list`: Vettori di matrici per ogni step k
+- `kwargs`: Parametri opzionali per configurazioni avanzate (es. `phases=N_phase`, `time_var=tfJ`)
+"""
+macro dynamics(model, state, input, A_list, B_list, args...)
+    # Argomenti posizionali opzionali: c_list
+    c_list_expr = :nothing
+    kv_args = []
+    
+    if length(args) > 0
+        if isa(args[1], Expr) && args[1].head == :(=)
+            kv_args = args 
+        else
+            c_list_expr = args[1] 
+            kv_args = args[2:end]
+        end
+    end
+
+    # Argomenti chiave-valore (settings + x0)
+    settings_setup = quote
+        settings = Dict{Symbol, Any}()
+        x0_val = nothing
+    end
+    
+    for arg in kv_args
+        if isa(arg, Expr) && arg.head == :(=)
+            key = arg.args[1]
+            val_expr = arg.args[2]
+            
+            if key == :x0
+                # Se la chiave è x0, la salviamo a parte
+                push!(settings_setup.args, quote
+                    x0_val = $(esc(val_expr))
+                end)
+            else
+                # Altrimenti va nei settings
+                push!(settings_setup.args, quote
+                    settings[$(QuoteNode(key))] = $(esc(val_expr))
+                end)
+            end
+        end
+    end
+
+    return quote
+        $settings_setup
+
+        A_val = $(esc(A_list))
+        B_val = $(esc(B_list))
+        c_val_raw = $(esc(c_list_expr))
+        
+        if c_val_raw === nothing
+            nx = size(A_val[1], 1)
+            c_val = [zeros(nx) for _ in 1:length(A_val)]
+        else
+            c_val = c_val_raw
+        end
+
+        dyn_data = DynamicsData(
+            $(QuoteNode(state)), 
+            $(QuoteNode(input)), 
+            A_val, B_val, c_val, 
+            x0_val, # Passiamo x0 alla struct
+            settings
+        )
+        
+        $(esc(model)).dynamics = dyn_data
+    end
+end
+
+# --- 4. Algebra ---
+function +(a::Union{Variable, AffExpr, QuadExpr, Number}, b::Union{Variable, AffExpr, QuadExpr, Number})
+    if a isa QuadExpr || b isa QuadExpr
+        qa = to_quad(a); qb = to_quad(b)
+        new_quad = copy(qa.quad_terms)
+        for (k, v) in qb.quad_terms; new_quad[k] = get(new_quad, k, 0.0) + v; end
+        return QuadExpr(new_quad, qa.aff + qb.aff)
+    else
+        ea = to_aff(a); eb = to_aff(b)
+        new_terms = copy(ea.terms)
+        for (v, coeff) in eb.terms; new_terms[v] = get(new_terms, v, 0.0) + coeff; end
+        return AffExpr(new_terms, ea.constant + eb.constant)
+    end
+end
+
+function -(a::Union{Variable, AffExpr, QuadExpr, Number}, b::Union{Variable, AffExpr, QuadExpr, Number})
+    return a + (-1 * b)
+end
+
+function *(c::Number, x::Variable); return AffExpr(Dict(x => Float64(c)), 0.0); end
+*(x::Variable, c::Number) = c * x
+function *(c::Number, e::AffExpr); new_terms = Dict(v => coeff * c for (v, coeff) in e.terms); return AffExpr(new_terms, e.constant * c); end
+*(e::AffExpr, c::Number) = c * e
+function *(c::Number, q::QuadExpr); new_quad = Dict(k => v * c for (k, v) in q.quad_terms); return QuadExpr(new_quad, q.aff * c); end
+*(q::QuadExpr, c::Number) = c * q
+function *(v1::Variable, v2::Variable); k = v1.idx <= v2.idx ? (v1, v2) : (v2, v1); return QuadExpr(Dict(k => 1.0), zero(AffExpr)); end
+function *(v::Variable, e::AffExpr)
+    q_terms = Dict{Tuple{Variable, Variable}, Float64}()
+    for (other_v, coeff) in e.terms
+        k = v.idx <= other_v.idx ? (v, other_v) : (other_v, v)
+        q_terms[k] = get(q_terms, k, 0.0) + coeff
+    end
+    return QuadExpr(q_terms, AffExpr(Dict(v => e.constant), 0.0))
+end
+*(e::AffExpr, v::Variable) = v * e
+^(v::Variable, p::Int) = p == 2 ? v * v : (p == 1 ? v : error("Power error"))
+
+function *(a::AbstractVector{<:Number}, x::Vector{Variable})
+    if length(x) == 1; return [ai * x[1] for ai in a]
+    else; error("Ambiguous multiplication: Vector * Vector."); end
+end
+
+# SOC
+function LinearAlgebra.norm(x::Vector{<:Union{Variable, AffExpr}}); return NormWrapper([to_aff(xi) for xi in x]); end
+function <=(lhs::NormWrapper, rhs::Union{Variable, AffExpr, Number}); return SOCConstraint(lhs.exprs, to_aff(rhs)); end
+
+# Linear Constraints
+function <=(lhs::Union{Variable, AffExpr}, rhs::Union{Number, Variable, AffExpr}); return Constraint(lhs - rhs, :le); end
+function ==(lhs::Union{Variable, AffExpr}, rhs::Union{Number, Variable, AffExpr}); return Constraint(lhs - rhs, :eq); end
+function >=(lhs::Union{Variable, AffExpr}, rhs::Union{Number, Variable, AffExpr}); return Constraint(lhs - rhs, :ge); end
+
+# --- 5. Estrazione Matrici ---
+function extract_matrices(m::Model)
+    n_vars = length(m.variables)
+    
+    H = zeros(Float64, n_vars, n_vars)
+    q_vec = zeros(Float64, n_vars)
+    obj = to_quad(m.objective)
+    
+    for (var, coeff) in obj.aff.terms; q_vec[var.idx] = coeff; end
+    for ((v1, v2), coeff) in obj.quad_terms
+        if v1.idx == v2.idx; H[v1.idx, v1.idx] = 2 * coeff
+        else; H[v1.idx, v2.idx] = coeff; H[v2.idx, v1.idx] = coeff; end
+    end
+    
+    lb = fill(-Inf, n_vars)
+    ub = fill(Inf, n_vars)
+    
+    true_constraints_eq = []
+    true_constraints_ineq = [] 
+    
+    for c in m.constraints
+        terms = c.expr.terms; constant = c.expr.constant
+        
+        # --- MODIFICA CRITICA QUI ---
+        # Trattiamo come Box Constraint solo se:
+        # 1. Coinvolge una sola variabile
+        # 2. NON è un'uguaglianza (:eq)
+        # Se è un'uguaglianza (es. x[1] == 0), vogliamo che finisca in F e g.
+        
+        is_single_var = (length(terms) == 1)
+        is_equality = (c.sense == :eq)
+        
+        if is_single_var && !is_equality
+            # Caso Box (solo disuguaglianze su singola variabile)
+            (var, coeff) = first(terms)
+            rhs = -constant; val = rhs / coeff
+            if c.sense == :le
+                if coeff > 0; ub[var.idx] = min(ub[var.idx], val)
+                else; lb[var.idx] = max(lb[var.idx], val) end
+            elseif c.sense == :ge
+                if coeff > 0; lb[var.idx] = max(lb[var.idx], val)
+                else; ub[var.idx] = min(ub[var.idx], val) end
+            end
+        else
+            # Caso Matrice (Uguaglianze o Disuguaglianze complesse)
+            if c.sense == :eq; push!(true_constraints_eq, c)
+            else; push!(true_constraints_ineq, c)
+            end
+        end
+    end
+    
+    n_eq = length(true_constraints_eq); n_ineq = length(true_constraints_ineq)
+    F = zeros(Float64, n_eq, n_vars); g = zeros(Float64, n_eq)
+    A = zeros(Float64, n_ineq, n_vars); b = zeros(Float64, n_ineq)
+    
+    for (i, c) in enumerate(true_constraints_eq)
+        for (var, coeff) in c.expr.terms; F[i, var.idx] = coeff; end
+        g[i] = -c.expr.constant
+    end
+    for (i, c) in enumerate(true_constraints_ineq)
+        mult = (c.sense == :ge) ? -1.0 : 1.0
+        for (var, coeff) in c.expr.terms; A[i, var.idx] = coeff * mult; end
+        b[i] = -c.expr.constant * mult
+    end
+
+    # --- Porzione corretta dentro extract_matrices ---
+    socs_data = []
+    for c in m.soc_constraints
+        # 1. Parte Vettoriale: ||Ax + b||
+        n_rows = length(c.vector_part)
+        A_cone = zeros(Float64, n_rows, n_vars)
+        b_cone = zeros(Float64, n_rows)
+        
+        for (i, expr) in enumerate(c.vector_part)
+            for (var, coeff) in expr.terms
+                A_cone[i, var.idx] = coeff
+            end
+            b_cone[i] = expr.constant
+        end
+        
+        # 2. Parte Scalare: <= c'x + d
+        # ATTENZIONE: c_cone qui deve raccogliere i coefficienti delle variabili nel RHS
+        c_cone = zeros(Float64, n_vars)
+        d_cone = c.scalar_part.constant
+        
+        for (var, coeff) in c.scalar_part.terms
+            c_cone[var.idx] = coeff  # <--- Questo estrae il vettore 'c'
+        end
+        
+        # Salviamo la tupla completa (A, b, c, d)
+        push!(socs_data, (A_cone, b_cone, c_cone, d_cone))
+    end
+    
+    return H, q_vec, F, g, A, b, lb, ub, socs_data
+end
+
+# --- 6. Nuova Funzione: Mappatura Risultati [NEW] ---
+"""
+    map_solution(m::Model, x_opt::Vector{Float64})
+
+Converte il vettore piatto x_opt in un NamedTuple contenente le variabili
+strutturate come definite nel modello (es. matrici, vettori, scalari).
+"""
+function map_solution(m::Model, x_opt::Vector{Float64})
+    results = Dict{Symbol, Any}()
+    
+    for (name, (indices, shape)) in m.var_info
+        # Estrai i valori grezzi dal vettore soluzione
+        raw_values = x_opt[indices]
+        
+        if shape == () 
+            # Caso scalare: prendiamo il singolo valore
+            results[name] = raw_values[1]
+        else
+            # Caso Array: Reshape alla forma originale
+            # reshape riempie colonna per colonna, che è coerente con come
+            # abbiamo appiattito gli indici nel macro @variable
+            results[name] = reshape(raw_values, shape)
+        end
+    end
+    
+    # Convertiamo il Dict in un NamedTuple per accesso comodo (res.x)
+    return (; results...)
+end
+
+# Moltiplicazione tra due espressioni affini (crea una QuadExpr)
+function *(a::AffExpr, b::AffExpr)
+    q_terms = Dict{Tuple{Variable, Variable}, Float64}()
+    aff_terms = Dict{Variable, Float64}()
+    
+    # 1. Termini quadratici (variabile * variabile)
+    for (v1, c1) in a.terms
+        for (v2, c2) in b.terms
+            k = v1.idx <= v2.idx ? (v1, v2) : (v2, v1)
+            q_terms[k] = get(q_terms, k, 0.0) + c1 * c2
+        end
+    end
+    
+    # 2. Termini lineari (variabile * costante)
+    for (v1, c1) in a.terms
+        aff_terms[v1] = get(aff_terms, v1, 0.0) + c1 * b.constant
+    end
+    for (v2, c2) in b.terms
+        aff_terms[v2] = get(aff_terms, v2, 0.0) + c2 * a.constant
+    end
+    
+    # 3. Termine costante
+    constant = a.constant * b.constant
+    
+    return QuadExpr(q_terms, AffExpr(aff_terms, constant))
+end
+
+# Elevamento a potenza per AffExpr
+^(e::AffExpr, p::Int) = p == 2 ? e * e : (p == 1 ? e : error("Solo potenze di 2 supportate in MiniJuMP"))
+
+end # Fine Modulo

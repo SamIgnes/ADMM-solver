@@ -1,0 +1,1355 @@
+module ADMMSOCP
+
+    using LinearAlgebra
+    using SparseArrays
+    using Printf
+    using ..MiniJuMP
+
+    # ==============================================================================
+    # 1. STRUTTURE DATI (TYPES)
+    # ==============================================================================
+
+    struct SOCData
+        Ind_Soc::Vector{Vector{Int}}   # Indici delle variabili vettoriali (x)
+        Ind_t_Soc::Vector{Int}         # Indici delle variabili scalari (t)
+        t_Soc::Vector{Float64}         # Valori fissi di t (se costanti)
+    end
+    # SOCData() = SOCData(Vector{Vector{Int}}[], Int[], Float64[])
+
+    struct RSOCData
+        Ind_x::Vector{Vector{Int}}
+        Ind_u::Vector{Int}
+        Ind_v::Vector{Int}
+        Shift_x::Vector{Vector{Float64}}
+        Value_u::Vector{Float64}
+        Value_v::Vector{Float64}
+    end
+    RSOCData() = RSOCData(Vector{Vector{Int}}[], Int[], Int[], Vector{Vector{Float64}}[], Float64[], Float64[])
+
+    struct InequalityData
+        A::SparseMatrixCSC{Float64, Int}
+        rhs_c::Vector{Float64}         # Ax <= c
+        Ind_Box::Vector{Int}           # Indici variabili soggette a clamp (l <= x <= u)
+        rhs_BoxMin::Vector{Float64}    # Limite inferiore
+        rhs_BoxMax::Vector{Float64}    # Limite superiore
+        Ind_NonNeg::Vector{Int}        # Indici variabili x >= 0 (ottimizzazione specifica)
+    end
+    InequalityData() = InequalityData(spzeros(0,0), Float64[], Int[], Float64[], Float64[], Int[])
+
+    # --- Data Structures ---
+    struct RiccatiSystem
+        A::Vector{Matrix{Float64}}
+        B::Vector{Matrix{Float64}}
+        c::Vector{Vector{Float64}}
+        idx_x::Vector{Vector{Int}}
+        idx_u::Vector{Vector{Int}}
+        
+        # Info per Hard Constraint x0
+        x0_fixed_vals::Vector{Float64} # Valori fisici
+        x0_fixed_idxs::Vector{Int}     # Indici relativi nello stato aumentato (es. 1:13)
+    end
+
+    struct RiccatiFactorization
+        P::Vector{Matrix{Float64}}      # Matrici Cost-to-Go
+        K::Vector{Matrix{Float64}}      # Guadagni di feedback
+        L::Vector{Vector{Float64}}      # Termini lineari feedforward (vettori)
+        # Matrici pre-calcolate per efficienza (es. inverso di (R + B'PB))
+        Psi_inv::Vector{Matrix{Float64}} 
+        Q::Vector{Matrix{Float64}}      # Hessiane estratte localmente
+        R::Vector{Matrix{Float64}}
+        M::Vector{Matrix{Float64}}      # Cross-terms (se presenti nella Hessiana globale)
+    end
+
+    struct SolverResult
+        x::Vector{Float64}
+        z::Union{Matrix{Float64}, Vector{Float64}, Nothing} # Dipende da come gestisci z globalmente
+        converged::Bool
+        iterations::Int
+        r_norm::Float64
+        s_norm::Float64
+    end
+
+
+    struct Problem
+        H::Matrix{Float64}                     # Matrice Hessiana
+        q::Vector{Float64}                     # Vettore lineare (costo)
+        F::Union{Matrix{Float64}, Nothing}     # Vincoli uguaglianza Matrix
+        g::Union{Vector{Float64}, Nothing}     # Vincoli uguaglianza RHS
+        Soc::SOCData
+        Rsoc::RSOCData
+        Ineq::InequalityData
+        Riccati::Union{RiccatiSystem, Nothing}
+    end
+
+    mutable struct WarmStartData
+        # Variabili Primali
+        x::Vector{Float64}
+        
+        # Variabili Duali (u) e Ausiliarie (z) per ogni blocco
+        # SOC
+        z_soc::Matrix{Float64}
+        u_soc::Matrix{Float64}
+        
+        # RSOC
+        z_rsoc::Matrix{Float64}
+        u_rsoc::Matrix{Float64}
+        
+        # Disuguaglianze Generiche (Ax <= c)
+        z_A::Vector{Float64}
+        u_A::Vector{Float64}
+        
+        # Box (Clamp)
+        z_Box::Vector{Float64}
+        u_Box::Vector{Float64}
+        
+        # NonNeg (x >= 0)
+        z_NonNeg::Vector{Float64}
+        u_NonNeg::Vector{Float64}
+
+        # Parametro rho (se adattivo, altrimenti resta fisso)
+        rho::Float64
+    end
+
+    # Costruttore vuoto (o per inizializzazione zero)
+    function WarmStartData(n::Int, m::Int, r::Int, na::Int, nu::Int, nn::Int)
+        return WarmStartData(
+            zeros(n),               # x
+            zeros(n, m), zeros(n, m),     # SOC (z, u) - nota: n qui include slack se usate, meglio controllare dimensione
+            zeros(n, r), zeros(n, r),     # RSOC
+            zeros(na), zeros(na),         # Ineq
+            zeros(nu), zeros(nu),         # Box
+            zeros(nn), zeros(nn),         # NonNeg
+            1.0                           # rho default
+        )
+    end
+
+    # ==============================================================================
+    # 2. CREAZIONE DEL PROBLEMA (DA MINI JUMP)
+    # ==============================================================================
+
+    """
+        ProblemCreator(H, q, F, g, A, b, lb, ub, socs)
+
+    Converte le matrici grezze estratte da MiniJuMP nelle strutture dati ottimizzate per ADMM.
+    """
+    function ProblemCreator(m::MiniJuMP.Model)
+
+        # 1. Estrai matrici standard (H, q, F, g, A, b...)
+        H, q, F, g, A, b, lb, ub, socs = MiniJuMP.extract_matrices(m)
+
+        # 2. Gestione Bounds e Coni (Come prima)
+        # ... (Copia il blocco "Ind_Box", "Soc" dal codice precedente) ...
+        # Ricostruzione rapida per completezza:
+        ind_soc_vec = Vector{Vector{Int}}(); ind_t_soc = Int[]; t_Soc = Vector{Float64}()
+        for s in socs
+            A_c, _, c_c, d_c = s
+            vec_idxs = findall(x -> x > 1e-9, vec(sum(abs, A_c, dims=1)))
+            scalar_idxs = findall(x -> abs(x) > 1e-9, c_c)
+            if !isempty(vec_idxs)
+                push!(ind_soc_vec, vec_idxs)
+                if !isempty(scalar_idxs); push!(ind_t_soc, scalar_idxs[1]); push!(t_Soc, d_c)
+                else; push!(t_Soc, d_c); end
+            end
+        end
+        Soc = ADMMSOCP.SOCData(ind_soc_vec, ind_t_soc, t_Soc)
+        
+        Ind_Box = Int[]; BoxMin = Float64[]; BoxMax = Float64[]; Ind_NonNeg = Int[]
+        for i in 1:length(q)
+            l, u = lb[i], ub[i]
+            if l == 0.0 && u == Inf; push!(Ind_NonNeg, i)
+            elseif l > -1e19 || u < 1e19
+                push!(Ind_Box, i); push!(BoxMin, max(l, -1e9)); push!(BoxMax, min(u, 1e9))
+            end
+        end
+        Ineq = ADMMSOCP.InequalityData(sparse(A), Vector{Float64}(b), Ind_Box, BoxMin, BoxMax, Ind_NonNeg)
+        
+        # 3. GENERAZIONE AUTOMATICA RICCATI DA @dynamics
+        riccati_sys = nothing
+        
+        if m.dynamics !== nothing
+            dyn = m.dynamics
+            raw_x_idxs, shape_x = m.var_info[dyn.state_name]
+            raw_u_idxs, shape_u = m.var_info[dyn.input_name]
+            idx_x_cols = reshape(raw_x_idxs, shape_x) 
+            idx_u_cols = reshape(raw_u_idxs, shape_u)
+            
+            # Recuperiamo x0 se presente
+            x0_val = dyn.x0 
+
+            # Check for State Reset Logic
+            if haskey(dyn.settings, :phases) && haskey(dyn.settings, :time_var)
+                N_phase = Int(dyn.settings[:phases])
+                tf_sym  = dyn.settings[:time_var]
+                
+                if haskey(m.var_info, tf_sym)
+                    raw_tf_idxs, _ = m.var_info[tf_sym]
+                    riccati_sys = build_augmented_riccati_reset(dyn.A_list, dyn.B_list, dyn.c_list, idx_x_cols, idx_u_cols, raw_tf_idxs, N_phase, x0_val)
+                else
+                    error("❌ Time variable :$tf_sym not found in model variables.")
+                end
+            else
+                # Standard
+                idx_x_all = [idx_x_cols[:, k] for k in 1:size(idx_x_cols, 2)]
+                idx_u_all = [idx_u_cols[:, k] for k in 1:size(idx_u_cols, 2)]
+                
+                x0_fixed_vals = (x0_val === nothing) ? Float64[] : x0_val
+                x0_fixed_idxs = (x0_val === nothing) ? Int[] : collect(1:length(x0_val))
+                
+                riccati_sys = RiccatiSystem(dyn.A_list, dyn.B_list, dyn.c_list, idx_x_all, idx_u_all, x0_fixed_vals, x0_fixed_idxs)
+            end
+        end
+
+        # Placeholder per RSOC
+        Rsoc = ADMMSOCP.RSOCData()
+
+        return ADMMSOCP.Problem(H, q, F, g, Soc, Rsoc, Ineq, riccati_sys)
+    end
+
+    # --------------------------------------------------------------------------
+    # BUILDER SISTEMA AUMENTATO (CON X0)
+    # --------------------------------------------------------------------------
+    function build_augmented_riccati_reset(Ad_list, Bd_list, cd_list, idx_x_cols, idx_u_cols, idx_tf, N_phase, x0_phys)
+        
+        N = length(Ad_list)
+        nx_phys = size(Ad_list[1], 1)       # 13
+        nu_phys = size(Bd_list[1], 2) - 1   # 4
+        
+        nu_aug_model = size(idx_u_cols, 1) 
+        ns_slack = nu_aug_model - nu_phys - 1
+        nx_riccati = nx_phys + 1            # 14
+        
+        A_list_aug = Matrix{Float64}[]
+        B_list_aug = Matrix{Float64}[]
+        c_list_aug = Vector{Float64}[]
+        
+        idx_x_all = Vector{Vector{Int}}()
+        idx_u_all = Vector{Vector{Int}}()
+        
+        for k in 1:N
+            # ... (Logica Loop identica alla tua versione originale) ...
+            # Calcolo Gate
+            curr_gate = div(k-1, N_phase) + 1
+            next_gate = div(k, N_phase) + 1
+            if next_gate > length(idx_tf); next_gate = length(idx_tf); end
+            
+            Ad, Bd, cd = Ad_list[k], Bd_list[k], cd_list[k]
+            B_phys_dyn = Bd[:, 1:nu_phys]
+            B_tf_dyn   = Bd[:, end] 
+            
+            # Aumentata A (14x14)
+            Aa = zeros(nx_riccati, nx_riccati)
+            Aa[1:nx_phys, 1:nx_phys] = Ad
+            Aa[1:nx_phys, end] = B_tf_dyn 
+            
+            # Reset Logic
+            is_switch = (k % N_phase == 0) && (k < N)
+            if is_switch; Aa[end, end] = 0.0; else; Aa[end, end] = 1.0; end
+            
+            # Aumentata B (14x18)
+            Ba = zeros(nx_riccati, nu_aug_model)
+            Ba[1:nx_phys, 1:nu_phys] = B_phys_dyn
+            if ns_slack > 0
+                rows_slack = min(nx_phys, ns_slack)
+                Ba[1:rows_slack, nu_phys+1:nu_phys+rows_slack] = I(rows_slack)
+            end
+            
+            # Reset Logic su B
+            if is_switch; Ba[end, end] = 1.0; else; Ba[end, end] = 0.0; end
+            
+            ca = zeros(nx_riccati); ca[1:nx_phys] = cd
+            push!(A_list_aug, Aa); push!(B_list_aug, Ba); push!(c_list_aug, ca)
+            
+            # Indices
+            real_v_idx = is_switch ? idx_tf[next_gate] : idx_tf[curr_gate]
+            current_x_indices = [idx_x_cols[:, k]; idx_tf[curr_gate]]
+            u_indices_model = idx_u_cols[:, k]
+            current_u_indices = [u_indices_model[1:end-1]; real_v_idx]
+            push!(idx_x_all, current_x_indices); push!(idx_u_all, current_u_indices)
+        end
+        
+        # Final State Indices
+        final_gate = div(N, N_phase) + 1
+        if final_gate > length(idx_tf); final_gate = length(idx_tf); end
+        final_x_indices = [idx_x_cols[:, N+1]; idx_tf[final_gate]]
+        push!(idx_x_all, final_x_indices)
+        
+        # --- MODIFICA CHIAVE QUI SOTTO ---
+        # Fissiamo SOLO la parte fisica. Lasciamo il tempo (ultimo indice) LIBERO.
+        if x0_phys !== nothing
+            x0_fixed_vals = x0_phys
+            x0_fixed_idxs = collect(1:nx_phys) # Indici 1..13
+            # NOTA: Non includiamo nx_riccati (14) qui!
+        else
+            x0_fixed_vals = Float64[]
+            x0_fixed_idxs = Int[]
+        end
+        
+        return ADMMSOCP.RiccatiSystem(A_list_aug, B_list_aug, c_list_aug, idx_x_all, idx_u_all, x0_fixed_vals, x0_fixed_idxs)
+    end
+
+    # ### NEW: Estrae i blocchi Q, R, M dalla Hessiana globale sparsa ###
+    function extract_local_hessians(H::AbstractMatrix, ric::RiccatiSystem)
+        N = length(ric.A) # Numero di step di controllo
+        Q_list = Matrix{Float64}[]
+        R_list = Matrix{Float64}[]
+        M_list = Matrix{Float64}[] # Cross term x'Hu
+
+        # Nota: idx_x ha N+1 elementi (x_0 ... x_N)
+        #       idx_u ha N elementi (u_0 ... u_{N-1})
+        
+        for k in 1:N
+            ix = ric.idx_x[k]
+            iu = ric.idx_u[k]
+            
+            # Estrazione sottomatrici dalla Hessiana globale
+            push!(Q_list, H[ix, ix])
+            push!(R_list, H[iu, iu])
+            push!(M_list, H[ix, iu]) # Termini misti (spesso zero)
+        end
+        # Ultimo step (solo stato finale)
+        ix_f = ric.idx_x[N+1]
+        push!(Q_list, H[ix_f, ix_f])
+        
+        return Q_list, R_list, M_list
+    end
+
+
+using StaticArrays
+
+
+# --- 1. SETUP DIMENSIONI (Adattale al tuo drone) ---
+# const Nx = 14  # Numero stati
+# const Nu = 18   # Numero input
+
+# # Definiamo tipi statici per il kernel matematico
+# const SMatNxNx = SMatrix{Nx, Nx, Float64, Nx*Nx}
+# const SMatNuNu = SMatrix{Nu, Nu, Float64, Nu*Nu}
+# const SMatNxNu = SMatrix{Nx, Nu, Float64, Nx*Nu}
+# const SMatNuNx = SMatrix{Nu, Nx, Float64, Nu*Nx}
+
+# # --- 2. IL KERNEL MATEMATICO (Pura velocità, usa solo tipi statici) ---
+# function riccati_core_static(
+#     A_s::Vector{SMatNxNx}, 
+#     B_s::Vector{SMatNxNu}, 
+#     Q_s::Vector{SMatNxNx}, 
+#     R_s::Vector{SMatNuNu}, 
+#     M_s::Vector{SMatNxNu}
+# )
+#     N = length(A_s)
+    
+#     # Pre-allochiamo vettori di StaticArrays (molto leggeri)
+#     P_s = Vector{SMatNxNx}(undef, N+1)
+#     K_s = Vector{SMatNuNx}(undef, N)
+#     Psi_inv_s = Vector{SMatNuNu}(undef, N)
+    
+#     # Condizione finale
+#     P_s[N+1] = Q_s[N+1]
+    
+#     # Backward Loop ottimizzato
+#     @inbounds for k in N:-1:1
+#         # Carichiamo nei registri CPU
+#         Ak, Bk = A_s[k], B_s[k]
+#         Qk, Rk, Mk = Q_s[k], R_s[k], M_s[k]
+#         Pk_next = P_s[k+1]
+        
+#         # 1. Psi e Inversa
+#         Psi = Rk + Bk' * Pk_next * Bk
+#         Psi_fact = cholesky(Symmetric(Psi)) # Alloc-free su StaticArrays
+#         Psi_inv_s[k] = inv(Psi_fact)
+        
+#         # 2. Guadagno K
+#         GainTerm = Bk' * Pk_next * Ak + Mk'
+#         Kk = Psi_fact \ GainTerm
+#         K_s[k] = Kk
+        
+#         # 3. Joseph Form Update
+#         # P = (A-BK)' P (A-BK) + K'RK + Q - (MK + K'M')
+#         A_cl = Ak - Bk * Kk
+#         P_mixed = Mk * Kk
+        
+#         # Calcolo P next
+#         P_val = A_cl' * Pk_next * A_cl + Kk' * Rk * Kk + Qk - (P_mixed + P_mixed')
+        
+#         # Simmetria forzata
+#         P_s[k] = (P_val + P_val') / 2.0
+#     end
+    
+#     return P_s, K_s, Psi_inv_s
+# end
+
+# # --- 3. L'INTERFACCIA (Compatibile con le tue struct attuali) ---
+# function factorize_riccati(H_global::AbstractMatrix, ric::RiccatiSystem)
+#     N = length(ric.A)
+    
+#     # 1. Estrazione dati (come facevi prima)
+#     Q, R, M = extract_local_hessians(H_global, ric)
+    
+#     # 2. CONVERSIONE INPUT (Matrix -> SMatrix)
+#     # È qui che paghiamo una piccola tassa per avere calcoli ultra-veloci dopo.
+#     # Usiamo 'reinterpret' dove possibile o costruttori diretti.
+#     A_static = [SMatNxNx(ric.A[k]) for k in 1:N]
+#     B_static = [SMatNxNu(ric.B[k]) for k in 1:N]
+#     Q_static = [SMatNxNx(Q[k])     for k in 1:N+1]
+#     R_static = [SMatNuNu(R[k])     for k in 1:N]
+#     M_static = [SMatNxNu(M[k])     for k in 1:N]
+    
+#     # 3. ESECUZIONE KERNEL
+#     P_s, K_s, Psi_inv_s = riccati_core_static(A_static, B_static, Q_static, R_static, M_static)
+    
+#     # 4. RICONVERSIONE OUTPUT (SMatrix -> Matrix)
+#     # Convertiamo i risultati statici in matrici standard per metterli nella tua struct originale.
+#     P_out = [Matrix(p) for p in P_s]
+#     K_out = [Matrix(k) for k in K_s]
+#     Psi_inv_out = [Matrix(psi) for psi in Psi_inv_s]
+    
+#     # 5. RITORNO
+#     # Restituisce esattamente lo stesso oggetto di prima. Nessuna modifica alle struct necessaria.
+#     return RiccatiFactorization(P_out, K_out, Vector{Vector{Float64}}[], Psi_inv_out, Q, R, M)
+# end
+
+
+
+function factorize_riccati(H_global::AbstractMatrix, ric::RiccatiSystem)
+    N = length(ric.A)
+    nx, nu = size(ric.B[1]) # Esempio: nx=14, nu=4
+    
+    Q, R, M = extract_local_hessians(H_global, ric)
+    
+    P = Vector{Matrix{Float64}}(undef, N+1)
+    K = Vector{Matrix{Float64}}(undef, N)
+    Psi_inv = Vector{Matrix{Float64}}(undef, N)
+    
+    # --- PRE-ALLOCAZIONE BUFFER ---
+    # Buffer Quadrati Stato (nx, nx)
+    buff_xx_1 = Matrix{Float64}(undef, nx, nx) 
+    buff_xx_2 = Matrix{Float64}(undef, nx, nx)
+    
+    # Buffer Quadrati Input (nu, nu)
+    buff_uu_1 = Matrix{Float64}(undef, nu, nu)
+    
+    # Buffer Rettangolari Misti (FONDAMENTALE averne due)
+    buff_xu   = Matrix{Float64}(undef, nx, nu) # Per P*B, M
+    buff_ux   = Matrix{Float64}(undef, nu, nx) # Per K, B'*P*A, M'
+    
+    # Inizializzazione P finale
+    P[N+1] = Matrix(Q[N+1])
+    
+    # Backward Loop
+    @inbounds for k in N:-1:1
+        Ak = ric.A[k]
+        Bk = ric.B[k]
+        Qk = Q[k]
+        Rk = R[k]
+        Mk = M[k]
+        Pk_next = P[k+1]
+        
+        # ---------------------------------------------------
+        # 1. Calcolo Psi = R + B' P B
+        # ---------------------------------------------------
+        # Psi = Rk
+        copyto!(buff_uu_1, Rk)
+        
+        # Temp = P * B (Risultato nx * nu) -> VA IN buff_xu
+        mul!(buff_xu, Pk_next, Bk) 
+        
+        # Psi += B' * (P * B) -> (nu * nx) * (nx * nu) -> (nu * nu)
+        mul!(buff_uu_1, Bk', buff_xu, 1.0, 1.0)
+        
+        Psi_fact = cholesky!(Symmetric(buff_uu_1))
+        Psi_inv[k] = inv(Psi_fact) # Opzionale, se serve dopo
+
+        # ---------------------------------------------------
+        # 2. Calcolo K
+        # GainTerm = B' P A + M'
+        # ---------------------------------------------------
+        
+        # Temp = P * A -> (nx * nx) -> VA IN buff_xx_1
+        mul!(buff_xx_1, Pk_next, Ak)
+        
+        # GainTerm = B' * (P * A) -> (nu * nx) * (nx * nx) -> (nu * nx) -> VA IN buff_ux
+        mul!(buff_ux, Bk', buff_xx_1)
+        
+        # GainTerm += M'
+        # Mk è (nx, nu), quindi Mk' è (nu, nx). Sommiamo su buff_ux
+        transpose_M = Mk'
+        @simd for i in eachindex(buff_ux)
+            buff_ux[i] += transpose_M[i]
+        end
+        
+        # K = Psi \ GainTerm
+        # Risultato (nu * nx). Salviamo in K[k]
+        # Nota: K[k] deve essere allocato o sovrascritto. 
+        # Qui lo creiamo. Se volessimo zero-alloc assoluto, K dovrebbe essere Matrix{Matrix} preallocata.
+        Kk = Psi_fact \ buff_ux
+        K[k] = Kk
+        
+        # (Opzionale: Copia Kk in buff_ux se serve per calcoli successivi senza riallocare, 
+        # ma Kk ci serve per il prossimo step)
+        
+        # ---------------------------------------------------
+        # 3. Aggiornamento P (Joseph Form)
+        # P = (A-BK)' P (A-BK) + K'RK + Q - (MK + K'M')
+        # ---------------------------------------------------
+        
+        # --- Termine Dinamico: (A-BK)' P (A-BK) ---
+        
+        # A_cl = A - B*K
+        copyto!(buff_xx_2, Ak)
+        # B * K -> (nx * nu) * (nu * nx) -> (nx * nx). Usiamo -1.0 per fare la sottrazione diretta
+        mul!(buff_xx_2, Bk, Kk, -1.0, 1.0) 
+        
+        # Temp = P * A_cl -> buff_xx_1
+        mul!(buff_xx_1, Pk_next, buff_xx_2)
+        
+        # P_new = A_cl' * (P * A_cl) -> buff_xx_2' * buff_xx_1
+        P_next_val = buff_xx_2' * buff_xx_1 
+        
+        # --- Termine Controllo: K' R K ---
+        # R * K -> (nu * nu) * (nu * nx) -> (nu * nx). Usiamo buff_ux come temp
+        mul!(buff_ux, Rk, Kk)
+        
+        # K' * (R * K) -> (nx * nu) * (nu * nx) -> (nx * nx)
+        # Aggiungiamo direttamente a P_next_val
+        mul!(P_next_val, Kk', buff_ux, 1.0, 1.0)
+        
+        # --- Termine Misto: -(MK + K'M') ---
+        # M * K -> (nx * nu) * (nu * nx) -> (nx * nx). Usiamo buff_xx_2 come temp
+        mul!(buff_xx_2, Mk, Kk)
+        
+        # Aggiungiamo Q e sottraiamo i termini misti
+        # P = P_dynamic + P_control + Q - M_term - M_term'
+        @simd for i in eachindex(P_next_val)
+            P_next_val[i] += Qk[i] - buff_xx_2[i] - buff_xx_2'[i]
+        end
+        
+        P[k] = Symmetric(P_next_val)
+    end
+    
+    return RiccatiFactorization(P, K, Vector{Vector{Float64}}[], Psi_inv, Q, R, M)
+end
+
+    function solve_riccati(fact::RiccatiFactorization, ric::RiccatiSystem, f_global::Vector{Float64})
+        N = length(ric.A)
+        nx = size(ric.A[1], 1) # 14
+        
+        # 1. Backward Pass (Calcolo vettori p) - INVARIATO
+        q_vecs = [f_global[ric.idx_x[k]] for k in 1:N]; push!(q_vecs, f_global[ric.idx_x[N+1]])
+        r_vecs = [f_global[ric.idx_u[k]] for k in 1:N]
+        
+        p = Vector{Vector{Float64}}(undef, N+1)
+        p[N+1] = -q_vecs[N+1] 
+        
+        for k in N:-1:1
+            aux = p[k+1] + fact.P[k+1] * ric.c[k]
+            d_term = fact.Psi_inv[k] * (-r_vecs[k] + ric.B[k]' * aux)
+            p[k] = -q_vecs[k] + ric.A[k]' * aux - (ric.A[k]' * fact.P[k+1] * ric.B[k] + fact.M[k]) * d_term
+        end
+        
+        # 2. Forward Pass con Ottimizzazione x0 - MODIFICATO
+        x_sol = Vector{Float64}(undef, length(f_global))
+        
+        # Matrice P0 e vettore p0 dal backward pass
+        P0 = fact.P[1]
+        p0 = p[1]
+        
+        # Identifichiamo indici fissi e liberi
+        # fixed: 1..13, free: 14
+        fixed_idxs = ric.x0_fixed_idxs
+        free_idxs = setdiff(1:nx, fixed_idxs)
+        
+        x_curr = zeros(nx)
+        
+        # Assegna parte fissa
+        if !isempty(fixed_idxs)
+            x_curr[fixed_idxs] = ric.x0_fixed_vals
+        end
+        
+        # Ottimizza parte libera (se esiste)
+        if !isempty(free_idxs)
+            # Sottomatrici
+            P_uu = P0[free_idxs, free_idxs] # Scalare nel tuo caso (1x1)
+            P_uc = P0[free_idxs, fixed_idxs] # Vettore (1x13)
+            p_u  = p0[free_idxs]
+            
+            # x_fixed
+            x_c = x_curr[fixed_idxs]
+            
+            # Risolvi sistema lineare: P_uu * x_u = - (P_uc * x_c + p_u)
+            rhs = - (P_uc * x_c + p_u)
+            
+            # Aggiungiamo piccola regolarizzazione se P_uu è singolare (non dovrebbe succedere se il costo sul tempo > 0)
+            x_u = (P_uu + 1e-8*I) \ rhs
+            
+            x_curr[free_idxs] = x_u
+        end
+        
+        # Salva x0 completo
+        x_sol[ric.idx_x[1]] = x_curr
+        
+        # Loop Forward standard
+        for k in 1:N
+            aux = p[k+1] + fact.P[k+1] * ric.c[k]
+            d_term = fact.Psi_inv[k] * (-r_vecs[k] + ric.B[k]' * aux)
+            
+            u_curr = -fact.K[k] * x_curr - d_term
+            x_sol[ric.idx_u[k]] = u_curr
+            
+            x_curr = ric.A[k] * x_curr + ric.B[k] * u_curr + ric.c[k]
+            x_sol[ric.idx_x[k+1]] = x_curr
+        end
+        
+        return x_sol
+    end
+    # ==============================================================================
+    # 3. INTERFACCIA SOLVE
+    # ==============================================================================
+
+    """
+        solve(prob::Problem; kwargs...)
+
+    Funzione wrapper principale per risolvere il problema ADMM.
+    """
+function solve(Problem::Problem; 
+            # Modificata la firma per accettare Ref
+            warm_start::Union{Ref{Union{WarmStartData, Nothing}}, Nothing}=nothing, 
+            update_ws::Bool=false,                              
+            ρ=1.0, α=1.0, max_iter=1000, tol=1e-4, verbose=true)
+
+        # Dimensioni per eventuale check
+        n = size(Problem.H, 1)
+
+        if verbose
+            println("🔵 Avvio ADMM Solver...")
+            if warm_start !== nothing
+                println("   🔥 Warm Start attivo.")
+            end
+        end
+
+        # Chiamata al core
+        x_opt, z_opt = admm_socp(Problem; 
+                                warm_start=warm_start, 
+                                update_ws=update_ws,
+                                ρ=ρ, α=α, max_iter=max_iter, tol=tol)
+
+        if verbose
+            println("🏁 Solver terminato.")
+        end
+
+        return x_opt, z_opt
+    end
+
+    # ==============================================================================
+    # 4. IMPLEMENTAZIONE CORE (admm_socp)
+    # ==============================================================================
+
+    function proj_soc(u::AbstractVector, t::Real, fixed_t::Bool)
+        if !fixed_t
+            nx = norm(u)
+            if nx <= t
+                return copy(u), t
+            elseif nx <= -t
+                return zeros(length(u)), 0.0
+            else
+                val = (nx + t) / (2 * nx)
+                return val * u, val * nx
+            end
+        else
+            # Caso t fisso
+            nx = norm(u)
+            if nx <= t
+                return copy(u), t
+            else
+                return (t / nx) * u, t
+            end
+        end
+    end
+
+    function proj_polytope(x, A, c)
+        # Placeholder: proiezione su politopo generico è complessa.
+        # Spesso in ADMM si converte Ax <= c in Ax + s = c, s >= 0
+        # Qui gestiamo solo il caso banale o assumiamo slack già inserite.
+        return x
+    end
+
+function admm_socp(Problem::Problem; 
+                   warm_start::Union{Ref{Union{WarmStartData, Nothing}}, Nothing}=nothing,
+                   update_ws::Bool=true,
+                   ρ=1.0, α=1.0, max_iter=200, ε_abs=1e-4, ε_rel=1e-4, tol=1e-1)
+
+        @time begin
+        # ... [Estrazione dati dal Problem come prima: Box_ind, A, c, ecc.] ...
+        Box_ind, A, c, Ind_NonNeg = Problem.Ineq.Ind_Box, Problem.Ineq.A, Problem.Ineq.rhs_c, Problem.Ineq.Ind_NonNeg
+        rhs_BoxMin, rhs_BoxMax = Problem.Ineq.rhs_BoxMin, Problem.Ineq.rhs_BoxMax
+        H, F, g, Soc, Rsoc, obj = Problem.H, Problem.F, Problem.g, Problem.Soc, Problem.Rsoc, Problem.q
+
+        x0 = zeros(size(H,1))
+
+
+        # ------------------------
+        # Dimensioni del problema
+        # ------------------------
+        n  = length(x0)             # dimensione delle variabili
+        m  = length(Soc.Ind_Soc)    # numero di vincoli conici
+        mv = length(Soc.Ind_t_Soc)  # numero di vincoli conici con variabile t
+        r  = length(Rsoc.Ind_x)
+        ru = length(Rsoc.Ind_u)
+        rv = length(Rsoc.Ind_v)
+        nu = length(Box_ind)          # numero di variabili con clamp
+        na = length(c)
+        
+        H = copy(H)
+        F = copy(F)
+        obj = copy(obj)
+        x0 = copy(x0)
+        ρ = copy(ρ)
+
+        if na > 0
+            # Aggiungi i vincoli di ineguaglianza generali alla matrice A
+            A = hcat(A,zeros(na, na))
+            for i in 1:na
+                A[i, n + i] = 1.0  # variabile slack
+                Ind_NonNeg = vcat(Ind_NonNeg, n + i)  # aggiungi variabile slack ai non-negativi
+            end
+
+            F = hcat(F, zeros(size(F, 1), size(A, 2) - size(F, 2)))
+            F = vcat(F, A)
+            g = vcat(g, c)
+            # Espandi il vettore dei costi c per le nuove variabili slack
+            obj = vcat(obj, zeros(na))
+            H = [H zeros(n,na); zeros(na, n+na)]
+            x0  = vcat(x0, zeros(na))
+        end
+
+        nn = length(Ind_NonNeg)
+        na_copy = na
+        na = 0
+
+        # ==========================================================
+        # 🔹 Equilibration
+        # ==========================================================
+        # H, F, g, Soc, Rsoc, Ineq, D, E = equilibrate_data(H, F, g, Soc, Rsoc, Ineq)
+
+        # # scala variabili iniziali e costo
+        # x0 = E .* x0
+        # obj = E .* obj
+
+        # ------------------------
+        # Variabili primali/dual
+        # ------------------------
+        x = copy(x0)
+
+        # SOC
+        z = m>0 ? zeros(n + na_copy, m) : zeros(0,0)
+        u = m>0 ? zeros(n + na_copy, m) : zeros(0,0)
+
+        # RSOC
+        zR = r>0 ? zeros(n + na_copy, r) : zeros(0,0)
+        uR = r>0 ? zeros(n + na_copy, r) : zeros(0,0)
+
+        # disuguaglianze
+        zA = na>0 ? zeros(n) : zeros(0)
+        uA = na>0 ? zeros(n) : zeros(0)
+
+        # clamp
+        zU = nu>0 ? zeros(nu) : zeros(0)
+        uU = nu>0 ? zeros(nu) : zeros(0)
+
+        zN = nn>0 ? zeros(nn) : zeros(0)
+        uN = nn>0 ? zeros(nn) : zeros(0)
+
+        # Sovrascrittura se Warm Start presente
+        if warm_start !== nothing && warm_start[] !== nothing
+            ws_data = warm_start[] # Estraiamo i dati dal contenitore
+            x .= ws_data.x
+
+            # Copia Duali e Ausiliarie (con check dimensionali di sicurezza)
+            if m > 0 && size(ws_data.z_soc) == size(z)
+                z .= ws_data.z_soc
+                u .= ws_data.u_soc
+            end
+            if r > 0 && size(ws_data.z_rsoc) == size(zR)
+                zR .= ws_data.z_rsoc
+                uR .= ws_data.u_rsoc
+            end
+            if nu > 0 && length(ws_data.z_Box) == length(zU)
+                zU .= ws_data.z_Box
+                uU .= ws_data.u_Box
+            end
+            if nn > 0 && length(ws_data.z_NonNeg) == length(zN)
+                zN .= ws_data.z_NonNeg
+                uN .= ws_data.u_NonNeg
+            end
+
+            # Se usi rho adattivo:
+            # ρ = ws_data.rho 
+        end
+
+
+        z_prev = copy(z)
+        zR_prev = copy(zR)
+        zU_prev = copy(zU)
+        zN_prev = copy(zN)
+        zA_prev = copy(zA)
+
+        rhs = zeros(n + na_copy + length(g))
+
+
+        # 1️⃣ Contributo vincoli conici
+        # SOC
+        if m > 0
+            for i in 1:m
+                idx_vec = Soc.Ind_Soc[i]
+                H[idx_vec, idx_vec] += ρ * I(length(idx_vec))
+            end
+            if mv > 0
+                for i in 1:mv
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    H[idx_scal, idx_scal] += ρ
+                end
+            end
+        else
+            sum_z_u = zeros(n)
+        end
+
+        # RSOC
+        if r > 0
+            for i in 1:r
+                idx_vec = Rsoc.Ind_x[i]
+                H[idx_vec, idx_vec] += ρ*I(length(idx_vec))
+            end
+            if ru > 0
+                for i in 1:ru
+                    idx_u   = Rsoc.Ind_u[i]
+                    H[idx_u, idx_u] += ρ
+                end
+            end
+            if rv > 0
+                for i in 1:rv
+                    idx_v   = Rsoc.Ind_v[i]
+                    H[idx_v, idx_v] += ρ
+                end
+            end
+        end
+
+        # 2️⃣ Contributo vincoli di disuguaglianza Ax ≤ c
+        if  na > 0
+            for i in 1:n
+                H[i,i] += ρ
+            end
+        end
+    
+        # 3️⃣ Contributo vincoli clamp
+        if nu > 0
+            for i in Box_ind
+                H[i,i] += ρ
+            end
+        end
+
+        if nn > 0
+            for i in Ind_NonNeg
+                H[i,i] += ρ
+            end
+        end
+
+        # # ------------------------
+        # # Fattorizzazioni (con o senza vincoli di uguaglianza)
+        # # ------------------------
+        use_riccati = (Problem.Riccati !== nothing) && (size(F,1) == 0) # Usa Riccati solo se non ci sono vincoli Equality Extra (diversi dalla dinamica)
+
+        # Nota: Se ci sono slack variables (na > 0), queste rompono la struttura Riccati standard se non gestite.
+        # Assumiamo che se l'utente passa un RiccatiSystem, sa che i vincoli F=g sono gestiti internamente o nulli.
+        
+        local riccati_fact # Dichiarazione scope esterno
+        local KKT_fact
+        local Hx_fact
+
+        if Problem.Riccati !== nothing
+            println("   🛡️ Verifica regolarizzazione input Riccati...")
+            
+            # Recupera tutti gli indici che la Riccati considera "Input" (u)
+            # Questo include controlli fisici E variabili slack/virtuali
+            all_u_indices = unique(vcat(Problem.Riccati.idx_u...))
+            
+            count_fixed = 0
+            for idx in all_u_indices
+                # Se la diagonale è troppo vicina a zero (costo nullo e nessun vincolo attivo)
+                if H[idx, idx] < 1e-6
+                    H[idx, idx] += ρ  # Aggiungi rho "a forza"
+                    count_fixed += 1
+                end
+            end
+            
+
+        end
+
+        if use_riccati
+            println("   ⚙️ Pre-computing Riccati Factorization...")
+            # La H qui è già stata modificata con i +ρ sulle diagonali.
+            # Questo è corretto: Riccati usa Q_aug = Q_orig + ρ*I_active
+            riccati_fact = factorize_riccati(H, Problem.Riccati)
+        else
+            # Metodo Classico
+            if F === nothing || size(F,1) == 0
+                Hx_fact = factorize(H)
+            else
+                KKT = [H F'; F zeros(size(F,1), size(F,1))]
+                @time KKT_fact = lu(sparse(KKT))
+            end
+        end
+        end
+        # ==========================================================
+        # Iterazioni ADMM
+        # ==========================================================
+        for k in 1:max_iter
+            # ------------------------
+            # x-update
+            # ------------------------
+            extra_term = zeros(n + na_copy)
+
+            # vincoli di disuguaglianza
+            if na > 0
+                @views extra_term .+= zA - uA
+            end
+
+            # clamp
+            if nu > 0
+                @views extra_term[Box_ind] .+= zU - uU
+            end
+
+            # non negatività
+            if nn > 0
+                @views extra_term[Ind_NonNeg] .+= zN - uN   
+            end
+
+            # Coni
+            if m > 0
+                sum_z_u = zeros(n+na_copy)
+                for j in 1:m
+                    @views sum_z_u .+= z[:,j] .- u[:,j]
+                end
+            end
+
+            if r>0
+                if m<1
+                    sum_z_u = zeros(n+na_copy)
+                end
+
+                for j in 1:r
+                    sum_z_u .+= zR[:,j] - uR[:,j]
+                end
+            end
+
+            # RHS per il sistema lineare
+            f = ρ*sum_z_u + ρ*extra_term - obj
+
+            # # RHS per il sistema lineare
+            # @views @. f = ρ*(z - u) - obj
+
+
+
+            # --- LINEAR SOLVE ---
+            if use_riccati
+                x = solve_riccati(riccati_fact, Problem.Riccati, f)
+                # display(x[end])
+                # display(norm(x))
+
+            else
+                if size(F,1) != 0
+                    rhs[1:length(f)] .= f
+                    rhs[length(f)+1:end] .= g   
+                    sol = KKT_fact \ rhs
+                    @views x = sol[1:(n+na_copy)]
+                    
+                else
+                    x = Hx_fact \ f
+                end
+            end
+
+
+            # ---------------------
+            # Over-relaxation
+            # ---------------------
+            # Per ogni blocco, costruiamo x_hat relativo
+            # SOC
+            x_hat_soc = m > 0 ? α .* x .+ (1-α) .* z_prev : nothing
+
+            # RSOC
+            x_hat_rsoc = r > 0 ? α .* x .+ (1-α) .* zR_prev : nothing
+
+            # Disequazioni
+            x_hat_A = na > 0 ? α .* x .+ (1-α) .* zA_prev : nothing
+
+            # Clamp
+            x_hat_U = nu > 0 ? α .* x[Box_ind] .+ (1-α) .* zU_prev : nothing
+
+            # Non negatività
+            x_hat_N = nn > 0 ? α .* x[Ind_NonNeg] .+ (1-α) .* zN_prev : nothing
+
+            # ------------------------
+            # z-update (vincoli conici)
+            # ------------------------
+            if m > 0
+                for i in 1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    if i <= mv
+                        idx_scal = Soc.Ind_t_Soc[i]
+                        z[idx_vec,i], z[idx_scal,i] = proj_soc(x_hat_soc[idx_vec,i] + u[idx_vec,i], x_hat_soc[idx_scal,i] + u[idx_scal,i], false)
+                    else
+                        idx_scal = i - mv
+                        
+                        z[idx_vec,i], _ = proj_soc(x_hat_soc[idx_vec,i] + u[idx_vec,i], Soc.t_Soc[idx_scal], true)
+                    end
+                end
+            end
+
+
+            # ---------------- z-update RSOC
+            if r>0
+                for i in 1:r
+                    if  i <= ru && i <rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_u   = Rsoc.Ind_u[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        zR[idx_u,i] , zR[idx_v,i], zR[idx_vec,i] = proj_rsoc( x_hat_rsoc[idx_u,i] + uR[idx_u,i], x_hat_rsoc[idx_v,i] + uR[idx_v,i] , x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] - Rsoc.Shift_x[i] , false, false)
+                    elseif i <= rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        _ , zR[idx_v,i], zR[idx_vec,i] = proj_rsoc( Rsoc.Value_u[i], x_hat_rsoc[idx_v,i] + uR[idx_v,i] , x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] - Rsoc.Shift_x[i] , true, false)
+                        zR[idx_vec,i] += Rsoc.Shift_x[i]
+                        #  zR[idx_vec,i], zR[idx_v,i] = proj_paraboloid(x[idx_vec] + uR[idx_vec,i], x[idx_v] + uR[idx_v,i], Rsoc.Shift_x[i])
+                    else
+                        idx_vec = Rsoc.Ind_x[i]
+                        _ , _, zR[idx_vec,i] = proj_rsoc(Rsoc.Value_u[i], Rsoc.Value_v[i] , x_hat_rsoc[idx_vec,i]+uR[idx_vec,i] - Rsoc.Shift_x[i] , true, true)
+                    end
+
+                end
+            end
+
+            # ------------------------
+            # z-update (vincoli Ax ≤ c)
+            # ------------------------
+            if  na > 0
+                zA = proj_polytope(x + uA, A, c)
+            end
+
+            # ------------------------
+            # z-update (Clamp: u_min ≤ u ≤ u_max)
+            # ------------------------
+            if nu > 0
+                @views xU = x[Box_ind]
+                zU .= clamp.(x_hat_U .+ uU, rhs_BoxMin, rhs_BoxMax)
+
+            end
+
+            if nn > 0
+                @views xN = x[Ind_NonNeg]
+                zN .= max.(0, x_hat_N + uN)
+            end
+
+            # ------------------------
+            # u-update
+            # ------------------------
+            if m > 0
+                for i in 1:mv
+                    idx_vec = Soc.Ind_Soc[i]
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    u[idx_vec,i] += x_hat_soc[idx_vec,i] - z[idx_vec,i]
+                    u[idx_scal,i]+= x_hat_soc[idx_scal,i] - z[idx_scal,i]
+                end
+                for i in mv+1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    u[idx_vec,i] += x_hat_soc[idx_vec,i] - z[idx_vec,i]
+                end 
+            end
+
+            if r>0
+                for i in 1:r
+                    if  i <= ru && i <rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_u   = Rsoc.Ind_u[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                        uR[idx_u,i]   += x_hat_rsoc[idx_u,i]   - zR[idx_u,i]
+                        uR[idx_v,i]   += x_hat_rsoc[idx_v,i]   - zR[idx_v,i]
+                    elseif i<=rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                        uR[idx_v,i]   += x_hat_rsoc[idx_v,i]   - zR[idx_v,i]
+                    else
+                        idx_vec = Rsoc.Ind_x[i]
+                        uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                    end
+                end
+            end
+
+            if  na > 0
+                uA += x_hat_A - zA
+            end
+            if nu > 0
+                uU += x_hat_U - zU
+            end
+            if nn > 0
+                uN += x_hat_N - zN
+            end
+
+            r_norm = 0.0
+
+            # SOC
+            if m > 0
+                for i in 1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    r_norm += sum(norm.(x_hat_soc[idx_vec,i] - z[idx_vec,i]))
+                end
+
+                for i in 1:mv
+                    idx_vec = Soc.Ind_Soc[i]
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    r_norm += sum(norm.(x_hat_soc[idx_vec,i] - z[idx_vec,i]))
+                    r_norm += sum(norm.(x_hat_soc[idx_scal,i] - z[idx_scal,i]))
+                end
+                for i in mv+1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    r_norm += sum(norm.(x_hat_soc[idx_vec,i] - z[idx_vec,i]))
+                end
+            end
+            
+            # RSOC DA FINIREEEEEEEEE
+
+            if r > 0
+                for i in 1:r
+                    idx_vec = Rsoc.Ind_x[i]
+                    # idx_y = Soc.Ind_u[i]
+                    # idx_z = Soc.Ind_v[i]
+                    r_norm += sum(norm.(x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]))
+                    # r_norm += sum(norm.(x[idx_y] - zR[idx_y,i]))
+                    # r_norm += sum(norm.(x[idx_z] - zR[idx_z,i]))
+                end
+            end
+            # Ax ≤ c
+            # if na > 0
+            #     r_norm += norm(x - zA)
+            # end
+            # Clamp
+            if nu > 0
+                r_norm += norm(x_hat_U-zU)
+            end
+            #NonNeg
+            if nn > 0
+                r_norm += norm(x_hat_N-zN)
+            end
+
+            # Costruzione vettore z concatenato per tolleranza primale
+            z_all = Float64[]
+            if m > 0
+                z_all = vcat(z_all, vec(z))
+            end
+            if r > 0
+                z_all = vcat(z_all, vec(zR))
+            end
+            if na > 0
+                z_all = vcat(z_all, zA)
+            end
+            if nu > 0
+                z_all = vcat(z_all, zU)
+            end
+            if nn > 0
+                z_all = vcat(z_all, zN)
+            end
+
+            # Tolleranza primale
+            ε_pri = sqrt(n)*ε_abs + ε_rel * norm(z_all)
+            # ε_pri = 1e-2
+            # ================================
+            # Calcolo residui duali
+            # ================================
+            s_norm = 0.0
+            if m > 0
+                s_norm += norm(ρ * vec(z - z_prev))
+            end
+            if r > 0
+                s_norm += norm(ρ * vec(zR - zR_prev))
+            end
+            if na > 0
+                s_norm += norm(ρ * (zA - zA_prev))
+            end
+            if nu > 0
+                s_norm += norm(ρ * (zU - zU_prev))
+            end
+            if nn > 0
+                s_norm += norm(ρ * (zN - zN_prev))
+            end
+
+            # Tolleranza duale
+            ε_dual = sqrt(n)*ε_abs + ε_rel*(norm(ρ*u)+norm(ρ*uR)+norm(ρ*uA)+norm(ρ*uU)+norm(ρ*uN))
+
+            # ================================
+            # Check stop
+            # ================================
+            stop = r_norm <= ε_pri && s_norm <= ε_dual
+
+            # stop=false
+            if stop
+                println("✅ Converged at iteration $k (r_norm=$r_norm, s_norm=$s_norm)")
+                break
+            end
+
+            # Aggiorna z_prev per il prossimo passo
+            if k != max_iter
+                z_prev  .= z
+                zR_prev .= zR
+                zA_prev .= zA
+                zU_prev .= zU
+                zN_prev .= zN
+            end
+
+            # Messaggio se raggiunto max_iter
+            if k == max_iter
+                # display(ε_pri)
+                # display(ε_dual)
+                println("⚠️ Raggiunto il numero massimo di iterazioni ($max_iter) senza convergenza. r_norm=$r_norm, s_norm=$s_norm")
+            end
+            # if k%100 == 0
+            #     ρ_old = ρ
+            #     ρ = update_rho(ρ, r_norm, s_norm)
+
+            #     H = H./ρ_old.*ρ
+            #     KKT = [H F'; F zeros(size(F,1), size(F,1))]
+            #     KKT_fact = lu(KKT)
+            # end
+        end
+
+        # ==========================================================
+        # Check generale di fattibilità
+        # ==========================================================
+        feasible = true
+        check_feas = false
+
+        if check_feas
+            # Vincoli conici
+            for i in 1:length(Soc.Ind_Soc)
+                if i <= mv
+                    dist = norm(x[Soc.Ind_Soc[i]]) - x[Soc.Ind_t_Soc[i]]
+                    if dist > tol
+                        ind = Soc.Ind_Soc[i]
+                        println("⚠️ Violato vincolo conico: distanza = $dist, Vincolo: $ind")
+                        feasible = false
+                    end
+                else
+                    dist = norm(x[Soc.Ind_Soc[i]]) - Soc.t_Soc[i]
+                    if dist > tol
+                        ind = Soc.Ind_Soc[i]
+                        println("⚠️ Violato vincolo conico: distanza = $dist, Vincolo: $ind")
+                        feasible = false
+                    end
+                end
+            end
+            #RSOC check
+            for i in 1:r
+                    if  i <= ru && i <rv
+                        dist = norm(x[Rsoc.Ind_x[i]])^2 - 2*x[Rsoc.Ind_u[i]] * x[Rsoc.Ind_v[i]]
+                    elseif i <= rv
+                        dist = norm(x[Rsoc.Ind_x[i]]-Rsoc.Shift_x[i])^2 - 2*Rsoc.Value_u[i]*x[Rsoc.Ind_v[i]]
+                        #  display(norm(x[Rsoc.Ind_x[i]]-Rsoc.Shift_x[i])^2)
+                        #  display(- 2*Rsoc.Value_u[i]*x[Rsoc.Ind_v[i]])
+
+                    else
+                        dist = norm(x[Rsoc.Ind_x[i]])^2 - 2*Rsoc.Value_u[i]*Rsoc.Value_v[i]
+                    end
+                
+                    if dist > tol
+                        ind = Rsoc.Ind_x[i]
+                        println("⚠️ Violato vincolo conico ruotato: distanza = $dist, Vincolo: $ind")
+                        feasible = false
+                    end
+            end
+
+            # Vincoli lineari di uguaglianza
+            if  size(F,1) != 0
+                residual = norm(F * x - g)
+                if residual > tol
+                    println("⚠️ Violati vincoli lineari di uguaglianza: residuo = $residual")
+                    feasible = false
+                end
+            end
+
+            # Vincoli di disuguaglianza
+            if na > 0
+                viol = A * x - c
+                if any(viol .> tol)
+                    println("⚠️ Violati vincoli di disuguaglianza: max violazione = $(maximum(viol))")
+                    feasible = false
+                end
+            end
+
+            if nu > 0
+                violSup = x[Box_ind] - rhs_BoxMax
+                violInf = x[Box_ind] - rhs_BoxMin
+                if any(violSup .> tol) || any(violInf .< -tol)
+                    println("⚠️ Violati vincoli di Bound: max violazione = $(maximum(vcat(violSup, -violInf)))")
+                    feasible = false
+                end
+            end
+
+            if nu > 0
+                viol = x[Ind_NonNeg]
+                if any(viol .<= -tol)
+                    println("⚠️ Violati vincoli di Non negatività: max violazione = $(minimum(viol))")
+                    feasible = false
+                end
+            end
+        end
+
+
+
+
+        if update_ws && warm_start !== nothing
+            
+            # NOTA: Usiamo na_copy, perché 'na' è stato settato a 0 precedentemente
+            # NOTA: Usiamo length(x) che include le slack variables
+            new_data = WarmStartData(length(x), m, r, na_copy, nu, nn)
+            
+            # Copia Primali
+            new_data.x .= x
+            
+            # Copia SOC
+            if m > 0
+                new_data.z_soc .= z
+                new_data.u_soc .= u
+            end
+            
+            # Copia RSOC
+            if r > 0
+                new_data.z_rsoc .= zR
+                new_data.u_rsoc .= uR
+            end
+            
+            # Copia Disuguaglianze Generiche (usa na_copy!)
+            if na_copy > 0
+                new_data.z_A .= zA
+                new_data.u_A .= uA
+            end
+            
+            # Copia Box
+            if nu > 0
+                new_data.z_Box .= zU
+                new_data.u_Box .= uU
+            end
+            
+            # Copia NonNeg
+            if nn > 0
+                new_data.z_NonNeg .= zN
+                new_data.u_NonNeg .= uN
+            end
+            
+            new_data.rho = ρ # Salva il rho finale
+
+            # Assegnamento al Reference
+            warm_start[] = new_data
+        end
+
+
+        # x = x ./ E
+        return x[1:n], z
+    end
+end # module

@@ -1,0 +1,503 @@
+module ADMMSOCP
+
+    using LinearAlgebra
+    using SparseArrays
+    using Printf
+    using QDLDL
+
+    # ==============================================================================
+    # 1. STRUTTURE DATI E TIMERS
+    # ==============================================================================
+
+    mutable struct ADMMTimers
+        t_setup::Float64
+        t_kkt_fact::Float64
+        t_lin_solve::Float64
+        t_vector_updates::Float64
+        t_projections::Float64
+        t_residuals::Float64
+    end
+    ADMMTimers() = ADMMTimers(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    struct SOCData
+        Ind_Soc::Vector{Vector{Int}}   
+        Ind_t_Soc::Vector{Int}         
+        t_Soc::Vector{Float64}         
+        Shift_x::Vector{Vector{Float64}} 
+        Shift_t::Vector{Float64}         
+    end
+
+    struct RSOCData
+        Ind_x::Vector{Vector{Int}}
+        Ind_u::Vector{Int}
+        Ind_v::Vector{Int}
+        Shift_x::Vector{Vector{Float64}}
+        Value_u::Vector{Float64}
+        Value_v::Vector{Float64}
+    end
+    RSOCData() = RSOCData(Vector{Vector{Int}}[], Int[], Int[], Vector{Vector{Float64}}[], Float64[], Float64[])
+
+    struct InequalityData
+        A::SparseMatrixCSC{Float64, Int}
+        rhs_c::Vector{Float64}         
+        Ind_Box::Vector{Int}           
+        rhs_BoxMin::Vector{Float64}    
+        rhs_BoxMax::Vector{Float64}    
+        Ind_NonNeg::Vector{Int}        
+    end
+    InequalityData() = InequalityData(spzeros(0,0), Float64[], Int[], Float64[], Float64[], Int[])
+
+    struct Problem
+        H::SparseMatrixCSC{Float64, Int}
+        q::Vector{Float64}                     
+        F::SparseMatrixCSC{Float64, Int}
+        g::Vector{Float64}                     
+        Soc::SOCData
+        Rsoc::RSOCData
+        Ineq::InequalityData
+    end
+
+    mutable struct WarmStartData
+        x::Vector{Float64}
+        z_soc::Matrix{Float64}
+        u_soc::Matrix{Float64}
+        z_rsoc::Matrix{Float64}
+        u_rsoc::Matrix{Float64}
+        z_A::Vector{Float64}
+        u_A::Vector{Float64}
+        z_Box::Vector{Float64}
+        u_Box::Vector{Float64}
+        z_NonNeg::Vector{Float64}
+        u_NonNeg::Vector{Float64}
+        rho::Float64
+    end
+
+    function WarmStartData(n::Int, m::Int, r::Int, na::Int, nu::Int, nn::Int)
+        return WarmStartData(
+            zeros(n),
+            zeros(n, max(m, 1)), zeros(n, max(m, 1)),
+            zeros(n, max(r, 1)), zeros(n, max(r, 1)),
+            zeros(na), zeros(na),
+            zeros(nu), zeros(nu),
+            zeros(nn), zeros(nn),
+            1.0
+        )
+    end
+
+    # ==============================================================================
+    # 2. CREAZIONE DEL PROBLEMA E FUNZIONI DI SUPPORTO
+    # ==============================================================================
+
+    function ProblemCreator(H::AbstractMatrix, q::AbstractVector,
+                            F::Union{AbstractMatrix, Nothing}, g::Union{AbstractVector, Nothing},
+                            A::Union{AbstractMatrix, Nothing}, b::Union{AbstractVector, Nothing},
+                            lb::Union{AbstractVector, Nothing}, ub::Union{AbstractVector, Nothing},
+                            socs::Vector)
+        n = length(q)
+        ind_soc_vec = Vector{Vector{Int}}()
+        ind_t_soc = Int[]
+        t_Soc = Vector{Float64}()
+        shift_x_vec = Vector{Vector{Float64}}()
+        shift_t_vec = Vector{Float64}()
+
+        for s in socs
+            A_cone, b_cone, c_cone, d_cone = s[1], s[2], s[3], s[4]
+            vec_idxs = findall(x -> x > 1e-9, vec(sum(abs, A_cone, dims=1)))
+            scalar_idxs = findall(x -> abs(x) > 1e-9, c_cone)
+            
+            if !isempty(vec_idxs) && !isempty(scalar_idxs)
+                push!(ind_soc_vec, vec_idxs); push!(ind_t_soc, scalar_idxs[1])
+                push!(t_Soc, d_cone); push!(shift_x_vec, b_cone); push!(shift_t_vec, d_cone)
+            elseif !isempty(vec_idxs) && isempty(scalar_idxs)
+                push!(ind_soc_vec, vec_idxs); push!(t_Soc, d_cone)
+                push!(shift_x_vec, b_cone); push!(shift_t_vec, d_cone)
+            else
+                error("❌ Errore nella definizione dei SOC")    
+            end
+        end
+        Soc = SOCData(ind_soc_vec, ind_t_soc, t_Soc, shift_x_vec, shift_t_vec)
+        Rsoc = RSOCData()
+
+        A_mat = (A === nothing || isempty(A)) ? spzeros(0, n) : sparse(A)
+        b_vec = (b === nothing || isempty(b)) ? Float64[] : Vector{Float64}(b)
+        F_mat = (F === nothing || isempty(F)) ? spzeros(0, n) : sparse(F)
+        g_vec = (g === nothing || isempty(g)) ? zeros(0) : Vector{Float64}(g)
+
+        Ind_Box = Int[]; BoxMin = Float64[]; BoxMax = Float64[]; Ind_NonNeg = Int[]
+        if lb !== nothing && ub !== nothing
+            for i in 1:n
+                l_val, u_val = lb[i], ub[i]
+                if l_val == -Inf && u_val == Inf continue end
+                if l_val == 0.0 && u_val == Inf
+                    push!(Ind_NonNeg, i)
+                else
+                    push!(Ind_Box, i); push!(BoxMin, l_val); push!(BoxMax, u_val)
+                end
+            end
+        end
+        Ineq = InequalityData(A_mat, b_vec, Ind_Box, BoxMin, BoxMax, Ind_NonNeg)
+
+        return Problem(sparse(H), Vector{Float64}(q), F_mat, g_vec, Soc, Rsoc, Ineq)
+    end
+
+    function proj_soc(u::AbstractVector, t::Real, fixed_t::Bool)
+        if !fixed_t
+            nx = norm(u)
+            if nx <= t return copy(u), t
+            elseif nx <= -t return zeros(length(u)), 0.0
+            else
+                val = (nx + t) / (2 * nx)
+                return val * u, val * nx
+            end
+        else
+            nx = norm(u)
+            if nx <= t return copy(u), t
+            else return (t / nx) * u, t
+            end
+        end
+    end
+
+    function proj_rsoc(u::Real, v::Real, x::AbstractVector, fixed_u::Bool, fixed_v::Bool)
+        u_proj, v_proj, x_proj = copy(u), copy(v), copy(x)
+        if fixed_u && fixed_v
+            nx2 = norm(x)^2
+            if nx2 > 2 * u * v
+                scale = sqrt(2 * u * v) / norm(x)
+                x_proj .= scale .* x
+            end
+        end
+        return u_proj, v_proj, x_proj
+    end
+
+    function build_kkt_system(H::SparseMatrixCSC, F::SparseMatrixCSC, ρ::Real, Soc, Rsoc, Box_ind, Ind_NonNeg)
+            ρ_float = Float64(ρ) # Convertiamo in sicurezza
+            H_rho = copy(H)
+            m, mv = length(Soc.Ind_Soc), length(Soc.Ind_t_Soc)
+            r, ru, rv = length(Rsoc.Ind_x), length(Rsoc.Ind_u), length(Rsoc.Ind_v)
+            
+            if m > 0
+                for i in 1:m
+                    idx_vec = Soc.Ind_Soc[i]; H_rho[idx_vec, idx_vec] += ρ_float * I(length(idx_vec))
+                end
+                for i in 1:mv
+                    idx_scal = Soc.Ind_t_Soc[i]; H_rho[idx_scal, idx_scal] += ρ_float
+                end
+            end
+            if r > 0
+                for i in 1:r idx_vec = Rsoc.Ind_x[i]; H_rho[idx_vec, idx_vec] += ρ_float * I(length(idx_vec)) end
+                for i in 1:ru idx_u = Rsoc.Ind_u[i]; H_rho[idx_u, idx_u] += ρ_float end
+                for i in 1:rv idx_v = Rsoc.Ind_v[i]; H_rho[idx_v, idx_v] += ρ_float end
+            end
+            for i in Box_ind H_rho[i,i] += ρ_float end
+            for i in Ind_NonNeg H_rho[i,i] += ρ_float end
+
+            if size(F, 1) > 0
+                R_reg = 1e-6 * sparse(I, size(F,1), size(F,1))
+                KKT = [H_rho F'; F -R_reg]
+                return qdldl(triu(KKT)), H_rho
+            else
+                return factorize(H_rho), H_rho
+            end
+        end
+    # ==============================================================================
+    # 3. INTERFACCIA SOLVE E CORE ADMM CON TIMERS
+    # ==============================================================================
+
+    function solve(Problem::Problem; 
+                   warm_start::Union{Ref{Union{WarmStartData, Nothing}}, Nothing}=nothing, 
+                   update_ws::Bool=true,                              
+                   ρ=1.0, α=1.0, max_iter=1000, tol=1e-4, verbose=true)
+
+        if verbose println("🔵 Avvio ADMM Solver...") end
+        x_opt, z_opt = admm_socp(Problem, warm_start=warm_start, update_ws=update_ws, ρ=ρ, α=α, max_iter=max_iter, tol=tol, verbose=verbose)
+        return x_opt, z_opt
+    end
+
+    function admm_socp(Problem::Problem; 
+                       warm_start::Union{Ref{Union{WarmStartData, Nothing}}, Nothing}=nothing,
+                       update_ws::Bool=true, ρ=1.0, α=1.0, max_iter=200, ε_abs=1e-5, ε_rel=1e-5, tol=1e-1, verbose=true)
+        
+        timers = ADMMTimers()
+        t_start_setup = time_ns()
+
+        Box_ind, A_orig, c = Problem.Ineq.Ind_Box, Problem.Ineq.A, Problem.Ineq.rhs_c
+        Ind_NonNeg = Problem.Ineq.Ind_NonNeg
+        rhs_BoxMin, rhs_BoxMax = Problem.Ineq.rhs_BoxMin, Problem.Ineq.rhs_BoxMax
+        H_orig, F_orig, g_orig, Soc, Rsoc, obj_orig = Problem.H, Problem.F, Problem.g, Problem.Soc, Problem.Rsoc, Problem.q
+
+        n_orig = size(H_orig, 1)
+        na = length(c)
+
+        if na > 0
+            Slack_Mat = sparse(1.0I, na, na)
+            A_ext = [A_orig Slack_Mat]
+            F_ext = [F_orig spzeros(size(F_orig, 1), na)]
+            
+            F = [F_ext; A_ext]
+            g = [g_orig; c]
+            H = blockdiag(H_orig, spzeros(na, na))
+            obj = [obj_orig; zeros(na)]
+            Ind_NonNeg = vcat(Ind_NonNeg, collect((n_orig+1):(n_orig+na)))
+        else
+            H, F, g, obj = H_orig, F_orig, g_orig, obj_orig
+        end
+
+        n_tot = size(H, 1)
+        m, mv = length(Soc.Ind_Soc), length(Soc.Ind_t_Soc)
+        r, ru, rv = length(Rsoc.Ind_x), length(Rsoc.Ind_u), length(Rsoc.Ind_v)
+        nu, nn = length(Box_ind), length(Ind_NonNeg)
+
+        x = zeros(n_tot)
+        z = m > 0 ? zeros(n_tot, m) : zeros(0,0)
+        u = m > 0 ? zeros(n_tot, m) : zeros(0,0)
+        zR = r > 0 ? zeros(n_tot, r) : zeros(0,0)
+        uR = r > 0 ? zeros(n_tot, r) : zeros(0,0)
+        zU = nu > 0 ? zeros(nu) : zeros(0)
+        uU = nu > 0 ? zeros(nu) : zeros(0)
+        zN = nn > 0 ? zeros(nn) : zeros(0)
+        uN = nn > 0 ? zeros(nn) : zeros(0)
+
+        z_prev, zR_prev, zU_prev, zN_prev = copy(z), copy(zR), copy(zU), copy(zN)
+
+        extra_term, sum_z_u, f = zeros(n_tot), zeros(n_tot), zeros(n_tot)
+        rhs, sol = zeros(n_tot + length(g)), zeros(n_tot + length(g))
+        
+        x_hat_soc = m > 0 ? zeros(n_tot, m) : zeros(0,0)
+        x_hat_rsoc = r > 0 ? zeros(n_tot, r) : zeros(0,0)
+        x_hat_U = nu > 0 ? zeros(nu) : zeros(0)
+        x_hat_N = nn > 0 ? zeros(nn) : zeros(0)
+
+        if warm_start !== nothing && warm_start[] !== nothing
+            ws = warm_start[]
+            x[1:length(ws.x)] .= ws.x
+            if m > 0; z .= ws.z_soc; u .= ws.u_soc; end
+            if r > 0; zR .= ws.z_rsoc; uR .= ws.u_rsoc; end
+            if nu > 0; zU .= ws.z_Box; uU .= ws.u_Box; end
+            if nn > 0
+                if na > 0
+                    zN[1:(nn-na)] .= ws.z_NonNeg; zN[(nn-na+1):end] .= ws.z_A
+                    uN[1:(nn-na)] .= ws.u_NonNeg; uN[(nn-na+1):end] .= ws.u_A
+                else
+                    zN .= ws.z_NonNeg; uN .= ws.u_NonNeg
+                end
+            end
+            ρ = ws.rho 
+        end
+        timers.t_setup = (time_ns() - t_start_setup) / 1e9
+
+        # --- TIMER: KKT FACTORIZATION ---
+        t_start_kkt = time_ns()
+        KKT_fact, H_rho = build_kkt_system(H, F, ρ, Soc, Rsoc, Box_ind, Ind_NonNeg)
+        timers.t_kkt_fact += (time_ns() - t_start_kkt) / 1e9
+
+        # ==========================================================
+        # ITERAZIONI ADMM
+        # ==========================================================
+        for k in 1:max_iter
+
+            # --- TIMER: VECTOR UPDATES (Pre-Solve) ---
+            t_vec = time_ns()
+            fill!(extra_term, 0.0)
+            fill!(sum_z_u, 0.0)
+
+            if nu > 0; @views extra_term[Box_ind] .+= zU .- uU; end
+            if nn > 0; @views extra_term[Ind_NonNeg] .+= zN .- uN; end
+            if m > 0
+                for j in 1:m @views sum_z_u .+= z[:,j] .- u[:,j] end
+            end
+            if r > 0
+                for j in 1:r @views sum_z_u .+= zR[:,j] .- uR[:,j] end
+            end
+            @. f = ρ * sum_z_u + ρ * extra_term - obj
+            timers.t_vector_updates += (time_ns() - t_vec) / 1e9
+
+            # --- TIMER: LINEAR SOLVE ---
+            t_solve = time_ns()
+            if size(F, 1) > 0
+                rhs[1:n_tot] .= f
+                rhs[n_tot+1:end] .= g
+                sol .= rhs
+                solve!(KKT_fact, sol)
+                x .= sol[1:n_tot]
+            else
+                x .= KKT_fact \ f
+            end
+            timers.t_lin_solve += (time_ns() - t_solve) / 1e9
+
+            # --- TIMER: VECTOR UPDATES (Over-relaxation) ---
+            t_vec2 = time_ns()
+            if m > 0;  @. x_hat_soc = α * x + (1-α) * z_prev; end
+            if r > 0;  @. x_hat_rsoc = α * x + (1-α) * zR_prev; end
+            if nu > 0; @views @. x_hat_U = α * x[Box_ind] + (1-α) * zU_prev; end
+            if nn > 0; @views @. x_hat_N = α * x[Ind_NonNeg] + (1-α) * zN_prev; end
+            timers.t_vector_updates += (time_ns() - t_vec2) / 1e9
+
+            # --- TIMER: PROJECTIONS (Z-Update) ---
+            t_proj = time_ns()
+            if m > 0
+                for i in 1:m
+                    idx_vec, b_shift = Soc.Ind_Soc[i], Soc.Shift_x[i]
+                    if i <= mv
+                        idx_scal, d_shift = Soc.Ind_t_Soc[i], Soc.Shift_t[i]
+                        v_in = x_hat_soc[idx_vec,i] + u[idx_vec,i] + b_shift
+                        t_in = x_hat_soc[idx_scal,i] + u[idx_scal,i] + d_shift
+                        
+                        z_v, z_t = proj_soc(v_in, t_in, false)
+                        z[idx_vec,i] .= z_v .- b_shift
+                        z[idx_scal,i] = z_t - d_shift
+                    else
+                        idx_scal = i - mv
+                        v_in = x_hat_soc[idx_vec,i] + u[idx_vec,i] + b_shift
+                        # Corretto: rimosso _ .=
+                        z_v, _ = proj_soc(v_in, Soc.t_Soc[idx_scal], true)
+                        z[idx_vec,i] .= z_v .- b_shift
+                    end
+                end
+            end
+
+            if r > 0
+                for i in 1:r
+                    if i <= ru && i < rv
+                        idx_vec, idx_u, idx_v = Rsoc.Ind_x[i], Rsoc.Ind_u[i], Rsoc.Ind_v[i]
+                        zu_in, zv_in = x_hat_rsoc[idx_u,i] + uR[idx_u,i], x_hat_rsoc[idx_v,i] + uR[idx_v,i]
+                        zx_in = x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] .- Rsoc.Shift_x[i]
+                        
+                        # CORREZIONE APPLICATA QUI: Evitiamo _ in assegnazione
+                        tu, tv, tx = proj_rsoc(zu_in, zv_in, zx_in, false, false)
+                        zR[idx_u,i] = tu
+                        zR[idx_v,i] = tv
+                        zR[idx_vec,i] .= tx
+                        
+                    elseif i <= rv
+                        idx_vec, idx_v = Rsoc.Ind_x[i], Rsoc.Ind_v[i]
+                        zv_in, zx_in = x_hat_rsoc[idx_v,i] + uR[idx_v,i], x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] .- Rsoc.Shift_x[i]
+                        
+                        _, tv, tx = proj_rsoc(Rsoc.Value_u[i], zv_in, zx_in, true, false)
+                        zR[idx_v,i] = tv
+                        zR[idx_vec,i] .= tx .+ Rsoc.Shift_x[i]
+                        
+                    else
+                        idx_vec = Rsoc.Ind_x[i]
+                        zx_in = x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] .- Rsoc.Shift_x[i]
+                        
+                        _, _, tx = proj_rsoc(Rsoc.Value_u[i], Rsoc.Value_v[i], zx_in, true, true)
+                        zR[idx_vec,i] .= tx
+                    end
+                end
+            end
+
+            if nu > 0 @views @. zU = clamp(x_hat_U + uU, rhs_BoxMin, rhs_BoxMax) end
+            if nn > 0 @views @. zN = max(0.0, x_hat_N + uN) end
+            timers.t_projections += (time_ns() - t_proj) / 1e9
+
+            # --- TIMER: VECTOR UPDATES (U-Update) ---
+            t_vec3 = time_ns()
+            if m > 0
+                for i in 1:mv
+                    idx_vec, idx_scal = Soc.Ind_Soc[i], Soc.Ind_t_Soc[i]
+                    @views @. u[idx_vec,i] += x_hat_soc[idx_vec,i] - z[idx_vec,i]
+                    u[idx_scal,i] += x_hat_soc[idx_scal,i] - z[idx_scal,i]
+                end
+                for i in mv+1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    @views @. u[idx_vec,i] += x_hat_soc[idx_vec,i] - z[idx_vec,i]
+                end
+            end
+
+            if r > 0
+                for i in 1:r
+                    if i <= ru && i < rv
+                        idx_vec, idx_u, idx_v = Rsoc.Ind_x[i], Rsoc.Ind_u[i], Rsoc.Ind_v[i]
+                        @views @. uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                        uR[idx_u,i] += x_hat_rsoc[idx_u,i] - zR[idx_u,i]
+                        uR[idx_v,i] += x_hat_rsoc[idx_v,i] - zR[idx_v,i]
+                    elseif i <= rv
+                        idx_vec, idx_v = Rsoc.Ind_x[i], Rsoc.Ind_v[i]
+                        @views @. uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                        uR[idx_v,i] += x_hat_rsoc[idx_v,i] - zR[idx_v,i]
+                    else
+                        idx_vec = Rsoc.Ind_x[i]
+                        @views @. uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                    end
+                end
+            end
+            if nu > 0; @. uU += x_hat_U - zU; end
+            if nn > 0; @. uN += x_hat_N - zN; end
+            timers.t_vector_updates += (time_ns() - t_vec3) / 1e9
+
+            # --- TIMER: RESIDUALS & RHO UPDATE ---
+            t_res = time_ns()
+            if k % 1 == 0
+                r_norm_sq = 0.0
+                if m > 0
+                    for i in 1:m
+                        idx_vec = Soc.Ind_Soc[i]
+                        @views r_norm_sq += sum((x_hat_soc[idx_vec,i] .- z[idx_vec,i]).^2)
+                        if i <= mv
+                            idx_scal = Soc.Ind_t_Soc[i]
+                            r_norm_sq += (x_hat_soc[idx_scal,i] - z[idx_scal,i])^2
+                        end
+                    end
+                end
+                if r > 0
+                    for i in 1:r
+                        idx_vec = Rsoc.Ind_x[i]
+                        @views r_norm_sq += sum((x_hat_rsoc[idx_vec,i] .- zR[idx_vec,i]).^2)
+                    end
+                end
+                if nu > 0; @views r_norm_sq += sum((x_hat_U .- zU).^2); end
+                if nn > 0; @views r_norm_sq += sum((x_hat_N .- zN).^2); end
+                r_norm = sqrt(r_norm_sq)
+
+                norm_x = norm(x)
+                norm_z_all = sqrt(sum(z.^2) + sum(zR.^2) + sum(zU.^2) + sum(zN.^2))
+                ε_pri = sqrt(n_tot)*ε_abs + ε_rel*max(norm_x, norm_z_all)
+
+                s_norm = sqrt(sum((ρ .* (z .- z_prev)).^2) + sum((ρ .* (zR .- zR_prev)).^2) + 
+                              sum((ρ .* (zU .- zU_prev)).^2) + sum((ρ .* (zN .- zN_prev)).^2))
+                
+                norm_u_all = sqrt(sum((ρ .* u).^2) + sum((ρ .* uR).^2) + sum((ρ .* uU).^2) + sum((ρ .* uN).^2))
+                ε_dual = sqrt(n_tot)*ε_abs + ε_rel*norm_u_all
+
+                if r_norm <= ε_pri && s_norm <= ε_dual
+                    if verbose println("✅ Converged at iter $k (r_norm=$(round(r_norm, sigdigits=4)), s_norm=$(round(s_norm, sigdigits=4)))") end
+                    break
+                end
+
+                if k % 100 == 0
+                    μ, τ = 10.0, 2.0
+                    ρ_new = (r_norm > μ * s_norm) ? ρ * τ : ((s_norm > μ * r_norm) ? ρ / τ : ρ)
+
+                    if ρ_new != ρ
+                        ρ = ρ_new
+                        t_kkt2 = time_ns()
+                        KKT_fact, H_rho = build_kkt_system(H, F, ρ, Soc, Rsoc, Box_ind, Ind_NonNeg)
+                        timers.t_kkt_fact += (time_ns() - t_kkt2) / 1e9
+                    end
+                end
+            end
+            timers.t_residuals += (time_ns() - t_res) / 1e9
+
+            if k != max_iter
+                if m > 0; z_prev .= z; end
+                if r > 0; zR_prev .= zR; end
+                if nu > 0; zU_prev .= zU; end
+                if nn > 0; zN_prev .= zN; end
+            end
+        end
+
+        if verbose
+            println("\n--- ⏱️ RISULTATI PROFILAZIONE ADMM (in secondi) ---")
+            @printf("Setup Memoria:       %.4f s\n", timers.t_setup)
+            @printf("Fattorizzazione KKT: %.4f s\n", timers.t_kkt_fact)
+            @printf("Risoluzione Lineare: %.4f s\n", timers.t_lin_solve)
+            @printf("Update Vettoriali:   %.4f s\n", timers.t_vector_updates)
+            @printf("Proiezioni (Coni):   %.4f s\n", timers.t_projections)
+            @printf("Calcolo Residui:     %.4f s\n", timers.t_residuals)
+            @printf("--------------------------------------------------\n")
+        end
+
+        return x[1:n_orig], z
+    end
+
+end # module

@@ -1,0 +1,61 @@
+module SCVX_Utilities
+    using LinearAlgebra
+    using Parameters
+    
+    function build_QR_drone(;
+        m::Int = 4,
+        u_max::Float64 = 2.425,
+        tf_est::Float64 = 10.0,
+        penalty_time::Float64 = 0.1,
+        Δp::Float64 = 0.1 ,
+        Δv::Float64 = 0.2,
+        Δθ::Float64 = 0.087,
+        Δω::Float64 = 0.5,
+        αQ::Float64 = 1e-2
+    )
+
+        # ------------------------------
+        # 1) Q raw via regola di Bryson
+        # ------------------------------
+        Qraw = zeros(13,13)
+
+        Qraw[1:3, 1:3]   .= 1/Δp^2  .* I(3)        # posizione
+        Qraw[4:6, 4:6]   .= 1/Δv^2  .* I(3)        # velocità
+        Qraw[7:9, 7:9]   .= 1/Δθ^2  .* I(3)        # attitudine (errore angolare)
+        Qraw[10:12,10:12].= 1/Δω^2  .* I(3)        # velocità angolare
+        Qraw[13,13]      = 1.0                     # eventuale stato extra
+
+        # Scala Q per renderlo un contributo secondario
+        Q = αQ * Qraw
+
+        # ------------------------------
+        # 2) R calcolata per avere un
+        #    contributo ~ penalty_time
+        # ------------------------------
+        R_diag = penalty_time / (m * u_max^2 * tf_est)
+        R = R_diag * I(m)*1e6
+
+        return Q, R
+    end
+
+    function linearize_and_discretize_ZOH(f_func, A_func, B_func, x, u, dt)
+        A = A_func(x, u)
+        B = B_func(x, u)
+        fval = f_func(x, u)
+        c = fval - A * x - B * u
+
+        # Matrice estesa per c
+        n = length(x)
+        m = length(u)
+        M = zeros(n+m+1, n+m+1)
+        M[1:n,1:n] = A
+        M[1:n,n+1:n+m] = B
+        M[1:n,end] = c
+        E = exp(dt * M)
+
+        Ad = E[1:n,1:n]
+        Bd = E[1:n,n+1:n+m]
+        cd = E[1:n,end]
+        return Ad, Bd, cd
+    end
+end

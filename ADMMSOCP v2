@@ -1,0 +1,1028 @@
+module ADMMSOCP
+
+    using LinearAlgebra
+    using SparseArrays
+    using Printf
+    using QDLDL
+
+    # ==============================================================================
+    # 1. STRUTTURE DATI (TYPES)
+    # ==============================================================================
+
+    struct SOCData
+        Ind_Soc::Vector{Vector{Int}}   
+        Ind_t_Soc::Vector{Int}         
+        t_Soc::Vector{Float64}         
+        Shift_x::Vector{Vector{Float64}} # <--- NUOVO (b_cone)
+        Shift_t::Vector{Float64}         # <--- NUOVO (d_cone)
+    end
+    # SOCData() = SOCData(Vector{Vector{Int}}[], Int[], Float64[])
+
+    struct RSOCData
+        Ind_x::Vector{Vector{Int}}
+        Ind_u::Vector{Int}
+        Ind_v::Vector{Int}
+        Shift_x::Vector{Vector{Float64}}
+        Value_u::Vector{Float64}
+        Value_v::Vector{Float64}
+    end
+    RSOCData() = RSOCData(Vector{Vector{Int}}[], Int[], Int[], Vector{Vector{Float64}}[], Float64[], Float64[])
+
+    struct InequalityData
+        A::SparseMatrixCSC{Float64, Int}
+        rhs_c::Vector{Float64}         # Ax <= c
+        Ind_Box::Vector{Int}           # Indici variabili soggette a clamp (l <= x <= u)
+        rhs_BoxMin::Vector{Float64}    # Limite inferiore
+        rhs_BoxMax::Vector{Float64}    # Limite superiore
+        Ind_NonNeg::Vector{Int}        # Indici variabili x >= 0 (ottimizzazione specifica)
+    end
+    InequalityData() = InequalityData(spzeros(0,0), Float64[], Int[], Float64[], Float64[], Int[])
+
+    struct SolverResult
+        x::Vector{Float64}
+        z::Union{Matrix{Float64}, Vector{Float64}, Nothing} # Dipende da come gestisci z globalmente
+        converged::Bool
+        iterations::Int
+        r_norm::Float64
+        s_norm::Float64
+    end
+
+    struct Problem
+        H::Matrix{Float64}                     # Matrice Hessiana
+        q::Vector{Float64}                     # Vettore lineare (costo)
+        F::Union{Matrix{Float64}, Nothing}     # Vincoli uguaglianza Matrix
+        g::Union{Vector{Float64}, Nothing}     # Vincoli uguaglianza RHS
+        Soc::SOCData
+        Rsoc::RSOCData
+        Ineq::InequalityData
+    end
+
+    mutable struct WarmStartData
+        # Variabili Primali
+        x::Vector{Float64}
+        
+        # Variabili Duali (u) e Ausiliarie (z) per ogni blocco
+        # SOC
+        z_soc::Matrix{Float64}
+        u_soc::Matrix{Float64}
+        
+        # RSOC
+        z_rsoc::Matrix{Float64}
+        u_rsoc::Matrix{Float64}
+        
+        # Disuguaglianze Generiche (Ax <= c)
+        z_A::Vector{Float64}
+        u_A::Vector{Float64}
+        
+        # Box (Clamp)
+        z_Box::Vector{Float64}
+        u_Box::Vector{Float64}
+        
+        # NonNeg (x >= 0)
+        z_NonNeg::Vector{Float64}
+        u_NonNeg::Vector{Float64}
+
+        # Parametro rho (se adattivo, altrimenti resta fisso)
+        rho::Float64
+    end
+
+    # Costruttore vuoto (o per inizializzazione zero)
+    function WarmStartData(n::Int, m::Int, r::Int, na::Int, nu::Int, nn::Int)
+        return WarmStartData(
+            zeros(n),               # x
+            zeros(n, m), zeros(n, m),     # SOC (z, u) - nota: n qui include slack se usate, meglio controllare dimensione
+            zeros(n, r), zeros(n, r),     # RSOC
+            zeros(na), zeros(na),         # Ineq
+            zeros(nu), zeros(nu),         # Box
+            zeros(nn), zeros(nn),         # NonNeg
+            1.0                           # rho default
+        )
+    end
+
+    # ==============================================================================
+    # 2. CREAZIONE DEL PROBLEMA (DA MINI JUMP)
+    # ==============================================================================
+
+    """
+        ProblemCreator(H, q, F, g, A, b, lb, ub, socs)
+
+    Converte le matrici grezze estratte da MiniJuMP nelle strutture dati ottimizzate per ADMM.
+    """
+    function ProblemCreator(H::AbstractMatrix, q::AbstractVector,
+                            F::Union{AbstractMatrix, Nothing}, g::Union{AbstractVector, Nothing},
+                            A::Union{AbstractMatrix, Nothing}, b::Union{AbstractVector, Nothing},
+                            lb::Union{AbstractVector, Nothing}, ub::Union{AbstractVector, Nothing},
+                            socs::Vector)
+
+        n = length(q)
+
+        # --- 1. GESTIONE VINCOLI CONICI  ---
+        ind_soc_vec = Vector{Vector{Int}}()
+        ind_t_soc = Int[]
+        t_Soc = Vector{Float64}()
+
+        
+        # Inizializza i nuovi vettori
+        ind_soc_vec = Vector{Vector{Int}}()
+        ind_t_soc = Int[]
+        t_Soc = Vector{Float64}()
+        shift_x_vec = Vector{Vector{Float64}}() # NUOVO
+        shift_t_vec = Vector{Float64}()         # NUOVO
+
+        for s in socs
+            A_cone = s[1]; b_cone = s[2]
+            c_cone = s[3]; d_cone = s[4]
+
+            vec_idxs = findall(x -> x > 1e-9, vec(sum(abs, A_cone, dims=1)))
+            scalar_idxs = findall(x -> abs(x) > 1e-9, c_cone)
+            
+            if !isempty(vec_idxs) && !isempty(scalar_idxs)
+                push!(ind_soc_vec, vec_idxs)
+                push!(ind_t_soc, scalar_idxs[1])
+                push!(t_Soc, d_cone)
+                
+                # Salviamo gli shift estratti da MiniJuMP
+                push!(shift_x_vec, b_cone)
+                push!(shift_t_vec, d_cone)
+
+            elseif !isempty(vec_idxs) && isempty(scalar_idxs)
+                push!(ind_soc_vec, vec_idxs)
+                push!(t_Soc, d_cone)
+                
+                push!(shift_x_vec, b_cone)
+                push!(shift_t_vec, d_cone)
+            else
+                error("❌ Errore")    
+            end
+        end
+
+        Soc = SOCData(ind_soc_vec, ind_t_soc, t_Soc, shift_x_vec, shift_t_vec)
+
+        # Placeholder per RSOC (non presenti in MiniJuMP standard)
+        Rsoc = RSOCData()
+
+        # --- 2. Gestione Disuguaglianze Generiche ---
+        A_mat = (A === nothing) ? spzeros(0, n) : sparse(A)
+        b_vec = (b === nothing) ? Float64[] : Vector{Float64}(b)
+
+        # --- 3. Gestione Bounds (Box vs NonNeg) ---
+        Ind_Box = Int[]
+        BoxMin = Float64[]
+        BoxMax = Float64[]
+        Ind_NonNeg = Int[]
+
+        if lb !== nothing && ub !== nothing
+            for i in 1:n
+                l_val = lb[i]
+                u_val = ub[i]
+
+                # Ignora variabili senza vincoli (-Inf, +Inf)
+                if l_val == -Inf && u_val == Inf
+                    continue
+                end
+
+                # Caso Non-Negatività Pura: x >= 0 (con u = +Inf)
+                if l_val == 0.0 && u_val == Inf
+                    push!(Ind_NonNeg, i)
+                else
+                    # Caso Box Generico (inclusi x >= k o x <= k)
+                    # Sostituiamo Inf con valori numerici "sicuri" per il clamp se necessario
+                    # ma Julia clamp gestisce Inf correttamente.
+                    push!(Ind_Box, i)
+                    push!(BoxMin, l_val)
+                    push!(BoxMax, u_val)
+                end
+            end
+        end
+
+        Ineq = InequalityData(A_mat, b_vec, Ind_Box, BoxMin, BoxMax, Ind_NonNeg)
+
+        # Gestione Uguaglianze Vuote
+        F_mat = (F === nothing || isempty(F)) ? zeros(0, n) : Matrix{Float64}(F)
+        g_vec = (g === nothing || isempty(g)) ? zeros(0) : Vector{Float64}(g)
+
+
+        problem = Problem(Matrix{Float64}(H), Vector{Float64}(q), F_mat, g_vec, Soc, Rsoc, Ineq)
+        return problem
+    end
+
+    # ==============================================================================
+    # 3. INTERFACCIA SOLVE
+    # ==============================================================================
+
+    """
+        solve(prob::Problem; kwargs...)
+
+    Funzione wrapper principale per risolvere il problema ADMM.
+    """
+function solve(Problem::Problem; 
+            # Modificata la firma per accettare Ref
+            warm_start::Union{Ref{Union{WarmStartData, Nothing}}, Nothing}=nothing, 
+            update_ws::Bool=true,                              
+            ρ=1.0, α=1.0, max_iter=1000, tol=1e-4, verbose=true)
+
+        # Dimensioni per eventuale check
+        n = size(Problem.H, 1)
+
+        if verbose
+            println("🔵 Avvio ADMM Solver...")
+            if warm_start !== nothing
+                println("   🔥 Warm Start attivo.")
+            end
+        end
+
+        # Chiamata al core
+        x_opt, z_opt = admm_socp(Problem; 
+                                warm_start=warm_start, 
+                                update_ws=update_ws,
+                                ρ=ρ, α=α, max_iter=max_iter, tol=tol)
+
+        if verbose
+            println("🏁 Solver terminato.")
+        end
+
+        return x_opt, z_opt
+    end
+
+    # ==============================================================================
+    # 4. IMPLEMENTAZIONE CORE (admm_socp)
+    # ==============================================================================
+
+    function proj_soc(u::AbstractVector, t::Real, fixed_t::Bool)
+        if !fixed_t
+            nx = norm(u)
+            if nx <= t
+                return copy(u), t
+            elseif nx <= -t
+                return zeros(length(u)), 0.0
+            else
+                val = (nx + t) / (2 * nx)
+                return val * u, val * nx
+            end
+        else
+            # Caso t fisso
+            nx = norm(u)
+            if nx <= t
+                return copy(u), t
+            else
+                return (t / nx) * u, t
+            end
+        end
+    end
+
+    function proj_polytope(x, A, c)
+        # Placeholder: proiezione su politopo generico è complessa.
+        # Spesso in ADMM si converte Ax <= c in Ax + s = c, s >= 0
+        # Qui gestiamo solo il caso banale o assumiamo slack già inserite.
+        return x
+    end
+
+function admm_socp(Problem::Problem; 
+                   warm_start::Union{Ref{Union{WarmStartData, Nothing}}, Nothing}=nothing,
+                   update_ws::Bool=true,
+                   ρ=1.0, α=1.0, max_iter=200, ε_abs=1e-5, ε_rel=1e-5, tol=1e-1)
+
+        # ... [Estrazione dati dal Problem come prima: Box_ind, A, c, ecc.] ...
+        Box_ind, A, c, Ind_NonNeg = Problem.Ineq.Ind_Box, Problem.Ineq.A, Problem.Ineq.rhs_c, Problem.Ineq.Ind_NonNeg
+        rhs_BoxMin, rhs_BoxMax = Problem.Ineq.rhs_BoxMin, Problem.Ineq.rhs_BoxMax
+        H, F, g, Soc, Rsoc, obj = Problem.H, Problem.F, Problem.g, Problem.Soc, Problem.Rsoc, Problem.q
+
+        x0 = zeros(size(H,1))
+
+
+        # ------------------------
+        # Dimensioni del problema
+        # ------------------------
+        n  = length(x0)             # dimensione delle variabili
+        m  = length(Soc.Ind_Soc)    # numero di vincoli conici
+        mv = length(Soc.Ind_t_Soc)  # numero di vincoli conici con variabile t
+        r  = length(Rsoc.Ind_x)
+        ru = length(Rsoc.Ind_u)
+        rv = length(Rsoc.Ind_v)
+        nu = length(Box_ind)          # numero di variabili con clamp
+        na = length(c)
+        
+        H = copy(H)
+        H_base = copy(H) # Aggiungi questa riga all'inizio, prima dei loop "H[i,i] += ρ"
+        F = copy(F)
+        obj = copy(obj)
+        x0 = copy(x0)
+        ρ = copy(ρ)
+
+        if na > 0
+            # Aggiungi i vincoli di ineguaglianza generali alla matrice A
+            A = hcat(A,zeros(na, na))
+            for i in 1:na
+                A[i, n + i] = 1.0  # variabile slack
+                Ind_NonNeg = vcat(Ind_NonNeg, n + i)  # aggiungi variabile slack ai non-negativi
+            end
+
+            F = hcat(F, zeros(size(F, 1), size(A, 2) - size(F, 2)))
+            F = vcat(F, A)
+            g = vcat(g, c)
+            # Espandi il vettore dei costi c per le nuove variabili slack
+            obj = vcat(obj, zeros(na))
+            H = [H zeros(n,na); zeros(na, n+na)]
+            x0  = vcat(x0, zeros(na))
+        end
+
+        nn = length(Ind_NonNeg)
+        na_copy = na
+        na = 0
+
+        # ==========================================================
+        # 🔹 Equilibration
+        # ==========================================================
+        # H, F, g, Soc, Rsoc, Ineq, D, E = equilibrate_data(H, F, g, Soc, Rsoc, Ineq)
+
+        # # scala variabili iniziali e costo
+        # x0 = E .* x0
+        # obj = E .* obj
+
+        # ------------------------
+        # Variabili primali/dual
+        # ------------------------
+        x = copy(x0)
+
+        # SOC
+        z = m>0 ? zeros(n + na_copy, m) : zeros(0,0)
+        u = m>0 ? zeros(n + na_copy, m) : zeros(0,0)
+
+        # RSOC
+        zR = r>0 ? zeros(n + na_copy, r) : zeros(0,0)
+        uR = r>0 ? zeros(n + na_copy, r) : zeros(0,0)
+
+        # disuguaglianze
+        zA = na>0 ? zeros(n) : zeros(0)
+        uA = na>0 ? zeros(n) : zeros(0)
+
+        # clamp
+        zU = nu>0 ? zeros(nu) : zeros(0)
+        uU = nu>0 ? zeros(nu) : zeros(0)
+
+        zN = nn>0 ? zeros(nn) : zeros(0)
+        uN = nn>0 ? zeros(nn) : zeros(0)
+
+        # Sovrascrittura se Warm Start presente
+        if warm_start !== nothing && warm_start[] !== nothing
+            ws_data = warm_start[] # Estraiamo i dati dal contenitore
+            x .= ws_data.x
+
+            # Copia Duali e Ausiliarie (con check dimensionali di sicurezza)
+            if m > 0 && size(ws_data.z_soc) == size(z)
+                z .= ws_data.z_soc
+                u .= ws_data.u_soc
+            end
+            if r > 0 && size(ws_data.z_rsoc) == size(zR)
+                zR .= ws_data.z_rsoc
+                uR .= ws_data.u_rsoc
+            end
+            if nu > 0 && length(ws_data.z_Box) == length(zU)
+                zU .= ws_data.z_Box
+                uU .= ws_data.u_Box
+            end
+            if nn > 0 && length(ws_data.z_NonNeg) == length(zN)
+                zN .= ws_data.z_NonNeg
+                uN .= ws_data.u_NonNeg
+            end
+
+            # Se usi rho adattivo:
+            # ρ = ws_data.rho 
+        end
+
+        # display(x)
+        # display(uU)
+
+        z_prev = copy(z)
+        zR_prev = copy(zR)
+        zU_prev = copy(zU)
+        zN_prev = copy(zN)
+        zA_prev = copy(zA)
+
+        rhs = zeros(n + na_copy + length(g))
+
+
+        # 1️⃣ Contributo vincoli conici
+        # SOC
+        if m > 0
+            for i in 1:m
+                idx_vec = Soc.Ind_Soc[i]
+                H[idx_vec, idx_vec] += ρ * I(length(idx_vec))
+            end
+            if mv > 0
+                for i in 1:mv
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    H[idx_scal, idx_scal] += ρ
+                end
+            end
+        else
+            sum_z_u = zeros(n)
+        end
+
+        # RSOC
+        if r > 0
+            for i in 1:r
+                idx_vec = Rsoc.Ind_x[i]
+                H[idx_vec, idx_vec] += ρ*I(length(idx_vec))
+            end
+            if ru > 0
+                for i in 1:ru
+                    idx_u   = Rsoc.Ind_u[i]
+                    H[idx_u, idx_u] += ρ
+                end
+            end
+            if rv > 0
+                for i in 1:rv
+                    idx_v   = Rsoc.Ind_v[i]
+                    H[idx_v, idx_v] += ρ
+                end
+            end
+        end
+
+        # 2️⃣ Contributo vincoli di disuguaglianza Ax ≤ c
+        if  na > 0
+            for i in 1:n
+                H[i,i] += ρ
+            end
+        end
+    
+        # 3️⃣ Contributo vincoli clamp
+        if nu > 0
+            for i in Box_ind
+                H[i,i] += ρ
+            end
+        end
+
+        if nn > 0
+            for i in Ind_NonNeg
+                H[i,i] += ρ
+            end
+        end
+
+        local S_fact, H_inv_diag
+
+        # # ------------------------
+        # # Fattorizzazioni (con o senza vincoli di uguaglianza)
+        # # ------------------------
+        if F === nothing && size(F,1) == 0
+            Hx_fact = factorize(H)
+        else
+            # KKT = [Hx F'; F zeros(size(F,1), size(F,1))]
+            R = 1e-6 * sparse(I, size(F,1), size(F,1))
+            KKT = [H F'; F -R]
+            # @time KKT_fact = lu(sparse(KKT))
+            KKT_tri = triu(sparse(KKT)) # QDLDL vuole la parte triangolare inferiore
+             @time KKT_fact = qdldl(KKT_tri)
+
+            # F = sparse(F)
+            # H_diag = diag(H)             
+            # # Evitiamo divisioni per zero se rho è 0 (non dovrebbe succedere)
+            # H_inv_diag = 1.0 ./ (H_diag .+ 1e-6) 
+
+            #  InvH_F_T = (F * Diagonal(H_inv_diag)) # Equivalente a F * H^-1
+            #  S = InvH_F_T * F'
+            #  S_fact = cholesky(Symmetric(S))
+
+            # error("KKT Factorization to be implemented")
+        end
+
+        # ==========================================================
+        # Iterazioni ADMM
+        # ==========================================================
+        for k in 1:max_iter
+
+            # ------------------------
+            # x-update
+            # ------------------------
+            extra_term = zeros(n + na_copy)
+
+            # vincoli di disuguaglianza
+            if na > 0
+                @views extra_term .+= zA - uA
+            end
+
+            # clamp
+            if nu > 0
+                @views extra_term[Box_ind] .+= zU - uU
+            end
+
+            # non negatività
+            if nn > 0
+                @views extra_term[Ind_NonNeg] .+= zN - uN   
+            end
+
+            # Coni
+            if m > 0
+                sum_z_u = zeros(n+na_copy)
+                for j in 1:m
+                    @views sum_z_u .+= z[:,j] .- u[:,j]
+                end
+            end
+
+            if r>0
+                if m<1
+                    sum_z_u = zeros(n+na_copy)
+                end
+
+                for j in 1:r
+                    sum_z_u .+= zR[:,j] - uR[:,j]
+                end
+            end
+
+            # RHS per il sistema lineare
+            f = ρ*sum_z_u + ρ*extra_term - obj
+
+            # # RHS per il sistema lineare
+            # @views @. f = ρ*(z - u) - obj
+
+
+            if  size(F,1) != 0
+                # Risoluzione sistema KKT (con vincoli Fx = g)
+                rhs[1:length(f)] .= f
+                rhs[length(f)+1:end] .= g   
+                # sol = KKT_fact \ rhs
+                sol = copy(rhs)
+                # @time solve!(KKT_fact, sol)
+                solve!(KKT_fact, sol)
+
+
+                x = sol[1:(n+na_copy)]
+
+
+                # v = f .* H_inv_diag
+                
+                # # 2. Calcoliamo il RHS per il sistema Schur: rhs_S = F*v - g
+                # # g sono i vincoli di uguaglianza (Problem.g)
+                # rhs_S = F * v - g
+                
+                # # 3. Risolviamo per i moltiplicatori lambda: S * lambda = rhs_S
+                # lambda = S_fact \ rhs_S
+                
+                # # 4. Ricostruiamo x: x = H^{-1} * (f - F' * lambda)
+                # #    x = v - H^{-1} * F' * lambda
+                
+                # # Calcolo efficiente: F' * lambda
+                # FT_lambda = F' * lambda
+                # x = v - (FT_lambda .* H_inv_diag)
+            else
+                # Caso senza vincoli di uguaglianza
+                x = Hx_fact \ f
+            end
+
+
+            # ---------------------
+            # Over-relaxation
+            # ---------------------
+            # Per ogni blocco, costruiamo x_hat relativo
+            # SOC
+            x_hat_soc = m > 0 ? α .* x .+ (1-α) .* z_prev : nothing
+
+            # RSOC
+            x_hat_rsoc = r > 0 ? α .* x .+ (1-α) .* zR_prev : nothing
+
+            # Disequazioni
+            x_hat_A = na > 0 ? α .* x .+ (1-α) .* zA_prev : nothing
+
+            # Clamp
+            x_hat_U = nu > 0 ? α .* x[Box_ind] .+ (1-α) .* zU_prev : nothing
+
+            # Non negatività
+            x_hat_N = nn > 0 ? α .* x[Ind_NonNeg] .+ (1-α) .* zN_prev : nothing
+
+            # ------------------------
+            # z-update (vincoli conici)
+            # ------------------------
+            if m > 0
+                for i in 1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    b_shift = Soc.Shift_x[i]  # Estrai lo shift del vettore (es. -x_lin)
+                    
+                    if i <= mv
+                        idx_scal = Soc.Ind_t_Soc[i]
+                        d_shift  = Soc.Shift_t[i] # Estrai lo shift dello scalare
+                        
+                        # 1. Aggiungi lo shift al segnale in ingresso
+                        v_in = x_hat_soc[idx_vec,i] + u[idx_vec,i] + b_shift
+                        t_in = x_hat_soc[idx_scal,i] + u[idx_scal,i] + d_shift
+                        
+                        # 2. Proietta sul cono standard
+                        z_v, z_t = proj_soc(v_in, t_in, false)
+                        
+                        # 3. Rimuovi lo shift per mappare z sulle variabili originali
+                        z[idx_vec,i]  = z_v - b_shift
+                        z[idx_scal,i] = z_t - d_shift
+                        
+                    else
+                        idx_scal = i - mv
+                        v_in = x_hat_soc[idx_vec,i] + u[idx_vec,i] + b_shift
+                        
+                        # t è fisso, non ha variabile da shiftare, usiamo direttamente Soc.t_Soc
+                        z_v, _ = proj_soc(v_in, Soc.t_Soc[idx_scal], true)
+                        
+                        z[idx_vec,i] = z_v - b_shift
+                    end
+                end
+            end
+
+
+            # ---------------- z-update RSOC
+            if r>0
+                for i in 1:r
+                    if  i <= ru && i <rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_u   = Rsoc.Ind_u[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        zR[idx_u,i] , zR[idx_v,i], zR[idx_vec,i] = proj_rsoc( x_hat_rsoc[idx_u,i] + uR[idx_u,i], x_hat_rsoc[idx_v,i] + uR[idx_v,i] , x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] - Rsoc.Shift_x[i] , false, false)
+                    elseif i <= rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        _ , zR[idx_v,i], zR[idx_vec,i] = proj_rsoc( Rsoc.Value_u[i], x_hat_rsoc[idx_v,i] + uR[idx_v,i] , x_hat_rsoc[idx_vec,i] + uR[idx_vec,i] - Rsoc.Shift_x[i] , true, false)
+                        zR[idx_vec,i] += Rsoc.Shift_x[i]
+                        #  zR[idx_vec,i], zR[idx_v,i] = proj_paraboloid(x[idx_vec] + uR[idx_vec,i], x[idx_v] + uR[idx_v,i], Rsoc.Shift_x[i])
+                    else
+                        idx_vec = Rsoc.Ind_x[i]
+                        _ , _, zR[idx_vec,i] = proj_rsoc(Rsoc.Value_u[i], Rsoc.Value_v[i] , x_hat_rsoc[idx_vec,i]+uR[idx_vec,i] - Rsoc.Shift_x[i] , true, true)
+                    end
+
+                end
+            end
+
+
+            # ------------------------
+            # z-update (vincoli Ax ≤ c)
+            # ------------------------
+            if  na > 0
+                zA = proj_polytope(x + uA, A, c)
+            end
+
+            # ------------------------
+            # z-update (Clamp: u_min ≤ u ≤ u_max)
+            # ------------------------
+            if nu > 0
+                @views xU = x[Box_ind]
+                zU .= clamp.(x_hat_U .+ uU, rhs_BoxMin, rhs_BoxMax)
+            end
+
+            if nn > 0
+                @views xN = x[Ind_NonNeg]
+                zN .= max.(0, x_hat_N + uN)
+            end
+
+            # ------------------------
+            # u-update
+            # ------------------------
+            if m > 0
+                for i in 1:mv
+                    idx_vec = Soc.Ind_Soc[i]
+                    idx_scal = Soc.Ind_t_Soc[i]
+                    u[idx_vec,i] += x_hat_soc[idx_vec,i] - z[idx_vec,i]
+                    u[idx_scal,i]+= x_hat_soc[idx_scal,i] - z[idx_scal,i]
+                end
+                for i in mv+1:m
+                    idx_vec = Soc.Ind_Soc[i]
+                    u[idx_vec,i] += x_hat_soc[idx_vec,i] - z[idx_vec,i]
+                end
+            end
+
+            if r>0
+                for i in 1:r
+                    if  i <= ru && i <rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_u   = Rsoc.Ind_u[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                        uR[idx_u,i]   += x_hat_rsoc[idx_u,i]   - zR[idx_u,i]
+                        uR[idx_v,i]   += x_hat_rsoc[idx_v,i]   - zR[idx_v,i]
+                    elseif i<=rv
+                        idx_vec = Rsoc.Ind_x[i]
+                        idx_v   = Rsoc.Ind_v[i]
+                        uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                        uR[idx_v,i]   += x_hat_rsoc[idx_v,i]   - zR[idx_v,i]
+                    else
+                        idx_vec = Rsoc.Ind_x[i]
+                        uR[idx_vec,i] += x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]
+                    end
+                end
+            end
+
+            if  na > 0
+                uA += x_hat_A - zA
+            end
+            if nu > 0
+                uU += x_hat_U - zU
+            end
+            if nn > 0
+                uN += x_hat_N - zN
+            end
+
+            if k%1==0
+                r_norm = 0.0
+
+                # SOC
+                if m > 0
+                    for i in 1:m
+                        idx_vec = Soc.Ind_Soc[i]
+                        r_norm += sum(norm.(x_hat_soc[idx_vec,i] - z[idx_vec,i]))
+                    end
+
+                    for i in 1:mv
+                        idx_vec = Soc.Ind_Soc[i]
+                        idx_scal = Soc.Ind_t_Soc[i]
+                        r_norm += sum(norm.(x_hat_soc[idx_vec,i] - z[idx_vec,i]))
+                        r_norm += sum(norm.(x_hat_soc[idx_scal,i] - z[idx_scal,i]))
+                    end
+                    for i in mv+1:m
+                        idx_vec = Soc.Ind_Soc[i]
+                        r_norm += sum(norm.(x_hat_soc[idx_vec,i] - z[idx_vec,i]))
+                    end
+                end
+                
+                # RSOC DA FINIREEEEEEEEE
+
+                if r > 0
+                    for i in 1:r
+                        idx_vec = Rsoc.Ind_x[i]
+                        # idx_y = Soc.Ind_u[i]
+                        # idx_z = Soc.Ind_v[i]
+                        r_norm += sum(norm.(x_hat_rsoc[idx_vec,i] - zR[idx_vec,i]))
+                        # r_norm += sum(norm.(x[idx_y] - zR[idx_y,i]))
+                        # r_norm += sum(norm.(x[idx_z] - zR[idx_z,i]))
+                    end
+                end
+                # Ax ≤ c
+                # if na > 0
+                #     r_norm += norm(x - zA)
+                # end
+                # Clamp
+                if nu > 0
+                    r_norm += norm(x_hat_U-zU)
+                end
+                #NonNeg
+                if nn > 0
+                    r_norm += norm(x_hat_N-zN)
+                end
+
+                # Costruzione vettore z concatenato per tolleranza primale
+                z_all = Float64[]
+                if m > 0
+                    z_all = vcat(z_all, vec(z))
+                end
+                if r > 0
+                    z_all = vcat(z_all, vec(zR))
+                end
+                if na > 0
+                    z_all = vcat(z_all, zA)
+                end
+                if nu > 0
+                    z_all = vcat(z_all, zU)
+                end
+                if nn > 0
+                    z_all = vcat(z_all, zN)
+                end
+
+                # Tolleranza primale
+                ε_pri = sqrt(n)*ε_abs + ε_rel*max(norm(x), norm(z_all))
+                # ε_pri = 1e-2
+                # display(ε_pri)
+
+                # ================================
+                # Calcolo residui duali
+                # ================================
+                s_norm = 0.0
+                if m > 0
+                    s_norm += norm(ρ * vec(z - z_prev))
+                end
+                if r > 0
+                    s_norm += norm(ρ * vec(zR - zR_prev))
+                end
+                if na > 0
+                    s_norm += norm(ρ * (zA - zA_prev))
+                end
+                if nu > 0
+                    s_norm += norm(ρ * (zU - zU_prev))
+                end
+                if nn > 0
+                    s_norm += norm(ρ * (zN - zN_prev))
+                end
+
+                # Tolleranza duale
+                ε_dual = sqrt(n)*ε_abs + ε_rel*(norm(ρ*u)+norm(ρ*uR)+norm(ρ*uA)+norm(ρ*uU)+norm(ρ*uN))
+
+                # ================================
+                # Check stop
+                # ================================
+                if r_norm <= ε_pri && s_norm <= ε_dual
+                    println("✅ Converged at iteration $k (r_norm=$r_norm, s_norm=$s_norm)")
+                    break
+                end
+            end
+
+            # Aggiorna z_prev per il prossimo passo
+            if k != max_iter
+                z_prev  .= z
+                zR_prev .= zR
+                zA_prev .= zA
+                zU_prev .= zU
+                zN_prev .= zN
+            end
+
+            # Messaggio se raggiunto max_iter
+            if k == max_iter
+                # display(ε_pri)
+                # display(ε_dual)
+                println("⚠️ Raggiunto il numero massimo di iterazioni ($max_iter) senza convergenza. r_norm=$r_norm, s_norm=$s_norm")
+            end
+            # if k%100 == 0
+            #     ρ_old = ρ
+            #     ρ = update_rho(ρ, r_norm, s_norm)
+
+            #     H = H./ρ_old.*ρ
+            #     KKT = [H F'; F zeros(size(F,1), size(F,1))]
+            #     KKT_fact = lu(KKT)
+            # end
+
+            # ==========================================================
+            # UPDATE ADATTIVO DI RHO (Residual Balancing)
+            # ==========================================================
+            if k % 100 == 0
+                μ = 10.0 # Soglia di sbilanciamento
+                τ = 2.0  # Fattore di scala
+            
+            ρ_new = ρ
+            
+            # Se il residuo primario è molto più grande del duale, la "molla" è troppo debole
+            if r_norm > μ * s_norm
+                ρ_new = ρ * τ
+            # Se il residuo duale è troppo grande, la "molla" è troppo rigida
+            elseif s_norm > μ * r_norm
+                ρ_new = ρ / τ
+            end
+                
+                # Se rho è cambiato, dobbiamo ricostruire la matrice KKT e rifattorizzarla
+                if ρ_new != ρ
+                    ρ = ρ_new
+                    
+                    # 1. Ripristiniamo l'Hessiana pulita
+                    H = copy(H_base)
+                    
+                    # 2. Riapplichiamo il nuovo rho sulla diagonale (ricopiamo la logica iniziale)
+                    if m > 0
+                        for i in 1:m
+                            idx_vec = Soc.Ind_Soc[i]; H[idx_vec, idx_vec] += ρ * I(length(idx_vec))
+                        end
+                        if mv > 0
+                            for i in 1:mv
+                                idx_scal = Soc.Ind_t_Soc[i]; H[idx_scal, idx_scal] += ρ
+                            end
+                        end
+                    end
+                    # (Se hai RSOC, Box, Ineq, aggiungi anche qui i loro +ρ come all'inizio)
+                    if na > 0; for i in 1:n; H[i,i] += ρ; end; end
+                    if nu > 0; for i in Box_ind; H[i,i] += ρ; end; end
+                    if nn > 0; for i in Ind_NonNeg; H[i,i] += ρ; end; end
+                    
+                    # 3. Ricostruiamo la KKT
+                    R_reg = 1e-4 * sparse(I, size(F,1), size(F,1))
+                    KKT = [H F'; F -R_reg] # <-- Ricorda il -R!
+                    KKT_tri = triu(sparse(KKT))
+                    
+                    # 4. Rifattorizziamo (Operazione costosa, per questo lo facciamo ogni 50 step)
+                    KKT_fact = qdldl(KKT_tri)
+                end
+                end
+            end
+
+        # ==========================================================
+        # Check generale di fattibilità
+        # ==========================================================
+        feasible = true
+        check_feas = false
+
+        if check_feas
+            # Vincoli conici
+            for i in 1:length(Soc.Ind_Soc)
+                if i <= mv
+                    dist = norm(x[Soc.Ind_Soc[i]]) - x[Soc.Ind_t_Soc[i]]
+                    if dist > tol
+                        ind = Soc.Ind_Soc[i]
+                        println("⚠️ Violato vincolo conico: distanza = $dist, Vincolo: $ind")
+                        feasible = false
+                    end
+                else
+                    dist = norm(x[Soc.Ind_Soc[i]]) - Soc.t_Soc[i]
+                    if dist > tol
+                        ind = Soc.Ind_Soc[i]
+                        println("⚠️ Violato vincolo conico: distanza = $dist, Vincolo: $ind")
+                        feasible = false
+                    end
+                end
+            end
+            #RSOC check
+            for i in 1:r
+                    if  i <= ru && i <rv
+                        dist = norm(x[Rsoc.Ind_x[i]])^2 - 2*x[Rsoc.Ind_u[i]] * x[Rsoc.Ind_v[i]]
+                    elseif i <= rv
+                        dist = norm(x[Rsoc.Ind_x[i]]-Rsoc.Shift_x[i])^2 - 2*Rsoc.Value_u[i]*x[Rsoc.Ind_v[i]]
+                        #  display(norm(x[Rsoc.Ind_x[i]]-Rsoc.Shift_x[i])^2)
+                        #  display(- 2*Rsoc.Value_u[i]*x[Rsoc.Ind_v[i]])
+
+                    else
+                        dist = norm(x[Rsoc.Ind_x[i]])^2 - 2*Rsoc.Value_u[i]*Rsoc.Value_v[i]
+                    end
+                
+                    if dist > tol
+                        ind = Rsoc.Ind_x[i]
+                        println("⚠️ Violato vincolo conico ruotato: distanza = $dist, Vincolo: $ind")
+                        feasible = false
+                    end
+            end
+
+            # Vincoli lineari di uguaglianza
+            if  size(F,1) != 0
+                residual = norm(F * x - g)
+                if residual > tol
+                    println("⚠️ Violati vincoli lineari di uguaglianza: residuo = $residual")
+                    feasible = false
+                end
+            end
+
+            # Vincoli di disuguaglianza
+            if na > 0
+                viol = A * x - c
+                if any(viol .> tol)
+                    println("⚠️ Violati vincoli di disuguaglianza: max violazione = $(maximum(viol))")
+                    feasible = false
+                end
+            end
+
+            if nu > 0
+                violSup = x[Box_ind] - rhs_BoxMax
+                violInf = x[Box_ind] - rhs_BoxMin
+                if any(violSup .> tol) || any(violInf .< -tol)
+                    println("⚠️ Violati vincoli di Bound: max violazione = $(maximum(vcat(violSup, -violInf)))")
+                    feasible = false
+                end
+            end
+
+            if nu > 0
+                viol = x[Ind_NonNeg]
+                if any(viol .<= -tol)
+                    println("⚠️ Violati vincoli di Non negatività: max violazione = $(minimum(viol))")
+                    feasible = false
+                end
+            end
+        end
+
+
+
+
+        if update_ws && warm_start !== nothing
+            
+            # NOTA: Usiamo na_copy, perché 'na' è stato settato a 0 precedentemente
+            # NOTA: Usiamo length(x) che include le slack variables
+            new_data = WarmStartData(length(x), m, r, na_copy, nu, nn)
+            
+            # Copia Primali
+            new_data.x .= x
+            
+            # Copia SOC
+            if m > 0
+                new_data.z_soc .= z
+                new_data.u_soc .= u
+            end
+            
+            # Copia RSOC
+            if r > 0
+                new_data.z_rsoc .= zR
+                new_data.u_rsoc .= uR
+            end
+            
+            # Copia Disuguaglianze Generiche (usa na_copy!)
+            if na_copy > 0
+                new_data.z_A .= zA
+                new_data.u_A .= uA
+            end
+            
+            # Copia Box
+            if nu > 0
+                new_data.z_Box .= zU
+                new_data.u_Box .= uU
+            end
+            
+            # Copia NonNeg
+            if nn > 0
+                new_data.z_NonNeg .= zN
+                new_data.u_NonNeg .= uN
+            end
+            
+            new_data.rho = ρ # Salva il rho finale
+
+            # Assegnamento al Reference
+            warm_start[] = new_data
+        end
+
+
+        # x = x ./ E
+        return x[1:n], z
+    end
+end # module
